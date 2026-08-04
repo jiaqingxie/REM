@@ -1,0 +1,36 @@
+{
+  "module": "experiments.cifar10.train_rem",
+  "shared": {
+    "global-batch-size": 128,
+    "total-steps": 150000,
+    "save-every": 5000,
+    "metric-weighted": true,
+    "divergence-correction": true
+  },
+  "seeds": [0, 1, 2],
+  "experiments": [
+    {"name": "em", "mode": "baseline", "mobility": "identity"},
+    {
+      "name": "em_large",
+      "mode": "em-large",
+      "mobility": "identity",
+      "requires-parameter-match": true
+    },
+    {"name": "em_const", "mode": "frozen", "mobility": "constant"},
+    {"name": "rem_scalar", "mode": "frozen", "mobility": "scalar"},
+    {"name": "rem_diagonal", "mode": "frozen", "mobility": "diagonal"},
+    {
+      "name": "rem_unfixed",
+      "mode": "frozen",
+      "mobility": "unfixed-diagonal"
+    },
+    {"name": "rem_low_rank", "mode": "frozen", "mobility": "low-rank"},
+    {
+      "name": "rem_joint",
+      "mode": "joint",
+      "mobility": "diagonal",
+      "contrastive-weight": 0.001,
+      "negative-steps": 200
+    }
+  ]
+}

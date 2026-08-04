@@ -1,199 +1,310 @@
 # Riemannian Energy Matching (REM)
 
-REM is a research project that extends [Energy Matching](https://arxiv.org/abs/2504.10612) with a learned state-dependent geometry. The goal is to improve transport alignment and Langevin mixing without giving up the time-independent scalar energy or its Boltzmann equilibrium.
+**Equilibrium-preserving mobility learning for static energy models**
 
-> **Status:** research prototype (`v0.1`). This first revision imports the official Energy Matching implementation, records the research plan, and adds reusable Riemannian geometry primitives. Results have not yet been validated.
+REM is a research project built on [Energy Matching](https://arxiv.org/abs/2504.10612). Its aim is not merely to attach a metric network to an energy-based model. The paper-level hypothesis is that a learned, gauge-fixed positive-definite mobility can resolve the conservative-field mismatch of Energy Matching while retaining one time-independent energy and exactly the same Boltzmann equilibrium.
 
-## Motivation
+> **Status: runnable experimental prototype; scientific claims not yet established.** The REM model, controlled experiments, CIFAR training/evaluation, inverse-problem transfer, artifact aggregation, and claim-gate checks are implemented. Full GPU runs have not yet been completed, so none of the target improvements below should be quoted as results.
 
-Energy Matching uses the Euclidean gradient field
+## One-sentence claim
+
+REM learns the smallest state-dependent deformation of Euclidean geometry under which an OT transport field is representable by the gradient of a single static energy, and reuses that geometry in an equilibrium-correct Langevin sampler without changing the modeled density.
+
+## Why this is a research problem
+
+Energy Matching regresses an OT velocity target `u(x)` with a Euclidean gradient field
 
 ```math
-v_\theta(x)=-\nabla V_\theta(x)
+u(x) \approx -\nabla V_\theta(x).
 ```
 
-both to transport noise toward data and to define the equilibrium density
+This is restrictive: a Euclidean gradient is curl-free, whereas finite-sample, distilled, or otherwise approximate transport targets generally contain non-conservative components. [Projected Energy Matching](https://arxiv.org/abs/2607.07749) identifies this as a structural conflict and introduces an auxiliary residual field.
+
+REM studies a different resolution. It learns an SPD mobility `G_phi(x)` and represents the transport as
 
 ```math
-\pi_\theta(x)\propto \exp\!\left(-V_\theta(x)/\varepsilon\right).
+u(x) \approx -G_\phi(x)\nabla V_\theta(x),
+\qquad G_\phi(x) \succ 0.
 ```
 
-A Euclidean gradient can be poorly conditioned and too restrictive for curved or anisotropic transport. REM learns a positive-definite mobility `G_phi(x)` and uses the Riemannian gradient
+Although `-G grad V` need not be a Euclidean gradient, it is a gradient under the inverse metric `g = G^{-1}`. This can enlarge the representable velocity class without abandoning the scalar energy used by the EBM.
+
+## Precise scope and terminology
+
+The first paper studies data in an ambient Euclidean space with Lebesgue reference measure `dx`. In this setting, `G(x)` is a state-dependent mobility, equivalently the inverse of a Riemannian metric. The induced probability-space dynamics can be interpreted through a mobility-weighted Wasserstein geometry.
+
+This distinction matters. REM does **not** initially claim to model data intrinsically supported on a known manifold, and it does not define the target density relative to the Riemannian volume form. Extensions to sphere-, Lie-group-, or mesh-valued data are outside the first-paper scope.
+
+## Theoretical core
+
+### 1. Representability
+
+Let `g(x) = grad V(x)`. If a nonzero target velocity satisfies
 
 ```math
-v_{\theta,\phi}(x)=-G_\phi(x)\nabla V_\theta(x).
+u(x)=-G(x)g(x), \qquad G(x)\succ0,
 ```
 
-Here `G_phi` is the mobility (the inverse Riemannian metric). The Euclidean Energy Matching model is recovered by setting `G_phi(x) = I`.
-
-## Equilibrium-correct dynamics
-
-REM samples with the Itô SDE
+then necessarily
 
 ```math
-dX_t = \left[-G_\phi(X_t)\nabla V_\theta(X_t)
+u(x)^\top g(x)<0.
+```
+
+Pointwise, this descent condition is also sufficient for the existence of an SPD matrix mapping `g(x)` to `-u(x)`. The intended first theorem will formalize this statement, handle zero sets, and give a constructive bounded-SPD solution. This yields a falsifiable diagnostic: for a frozen Energy Matching potential, we can measure how often the OT target violates the descent condition before training any mobility.
+
+The paper will not claim that every arbitrary vector field is globally a Riemannian gradient. Global smoothness, topology, and the existence of a common Lyapunov potential remain explicit assumptions.
+
+### 2. Gauge fixing and minimal distortion
+
+The factorization `G grad V` is not identifiable without constraints. A transport loss alone permits scale exchange and other local degeneracies between the energy and mobility. REM therefore treats gauge fixing as part of the method rather than an implementation detail.
+
+The target constrained objective is
+
+```math
+\min_{\theta,\phi}\;
+\mathbb E\!\left[
+\left\|u+G_\phi\nabla V_\theta\right\|_{G_\phi^{-1}}^2
+\right]
++\lambda_{\mathrm{geom}}\,
+\mathbb E\!\left[\|\log G_\phi\|_F^2\right]
++\lambda_{\mathrm{CD}}\mathcal L_{\mathrm{CD}},
+```
+
+subject to
+
+```math
+g_{\min}I\preceq G_\phi(x)\preceq g_{\max}I,
+\qquad \log\det G_\phi(x)=0.
+```
+
+`log det G = 0` removes the pointwise scalar gauge, uniform ellipticity prevents singular shortcuts, and the log-metric penalty selects the least deformation from Euclidean geometry. The Euclidean model remains the exact `G = I` special case.
+
+For a diagonal pilot, the determinant constraint can be enforced by centering predicted log-mobilities:
+
+```math
+r_\phi(x)=\alpha\tanh h_\phi(x),\qquad
+\log G_{ii}(x)=r_i(x)-\frac{1}{d}\sum_j r_j(x).
+```
+
+### 3. Equilibrium preservation
+
+REM uses the Itô diffusion
+
+```math
+dX_t=
+\left[-G_\phi(X_t)\nabla V_\theta(X_t)
 +\varepsilon\,\nabla\!\cdot G_\phi(X_t)\right]dt
 +\sqrt{2\varepsilon G_\phi(X_t)}\,dW_t.
 ```
 
-The divergence term is essential. With it, the Fokker-Planck equation becomes
+Its Fokker-Planck equation is
 
 ```math
 \partial_t\rho
-=\nabla\!\cdot\left[G_\phi\left(\rho\nabla V_\theta
-+\varepsilon\nabla\rho\right)\right],
+=\nabla\!\cdot\left[
+G_\phi\left(\rho\nabla V_\theta+\varepsilon\nabla\rho\right)
+\right],
 ```
 
-so the stationary density remains
+so, under standard regularity and integrability assumptions, the stationary density with respect to `dx` is
 
 ```math
-\rho_\infty(x)\propto\exp\!\left(-V_\theta(x)/\varepsilon\right).
+\rho_\infty(x)\propto\exp\!\left[-V_\theta(x)/\varepsilon\right].
 ```
 
-This distinction is central to REM: the geometry changes the dynamics and mixing, not the target density.
+The divergence correction is therefore mandatory. Continuous-time invariance does not remove Euler-Maruyama discretization bias; the experiments separately quantify both sources of error.
 
-## Training objective
+## Target contributions
 
-For an OT-coupled source/data pair, let
+A main-conference submission must support all four contributions below.
 
-```math
-x_t=(1-t)x_0+t x_1, \qquad u_t=x_1-x_0.
-```
+1. **Representation:** characterize when a transport field can be expressed as a gradient under a learned SPD mobility, including a constructive result and a measurable violation criterion.
+2. **Identifiable learning:** introduce a gauge-fixed, minimal-distortion objective that avoids trivial metric scaling and recovers Energy Matching at `G = I`.
+3. **Equilibrium-correct generation:** use the same learned geometry for transport and Langevin mixing while provably preserving the static energy's Boltzmann density.
+4. **Mechanistic evidence:** show that gains come from closing the conservative projection gap and improving mixing, not merely from adding parameters or compute.
 
-The proposed transport objective is
+If the work only produces a small FID improvement from an extra network, it does not satisfy the intended contribution.
 
-```math
-\mathcal L_{\mathrm{ROT}}
-=\mathbb E\left[\left\|-G_\phi(x_t)\nabla V_\theta(x_t)-u_t\right\|^2\right].
-```
+## Training strategy
 
-The full Phase 2 objective is
+REM deliberately avoids joint training from scratch in the first experiments.
 
-```math
-\mathcal L
-=\mathcal L_{\mathrm{ROT}}
-+\lambda_{\mathrm{CD}}\mathcal L_{\mathrm{CD}}
-+\lambda_G\mathcal R_G.
-```
+1. **Energy Matching baseline:** train or load the official `V_theta` and reproduce its reported sampling behavior.
+2. **Frozen-energy diagnostic:** freeze `V_theta`, measure the descent-condition violation rate, and train only `G_phi`. This is the clean causal test of whether geometry helps a fixed energy.
+3. **Gauge-fixed joint refinement:** jointly update `V_theta` and `G_phi` with a trust-region penalty around the frozen solution.
+4. **Contrastive phase:** use the equilibrium-correct mobility sampler for negative generation and include both modules in EMA and checkpoints.
 
-`R_G` prevents scale and condition-number collapse. The initial implementation will bound the diagonal mobility between `g_min` and `g_max` and regularize its mean toward one.
+The frozen-energy result is a required experiment, not an optional ablation. It separates a better sampler from a better/larger model.
 
-## What is implemented
+## Claim gates
 
-The [`rem/geometry.py`](rem/geometry.py) module currently provides:
+The project advances only when the preceding gate passes.
 
-- identity and bounded diagonal mobility modules;
-- Riemannian velocity and transport loss;
-- Hutchinson/JVP estimation of `div G`;
-- an Itô-correct Riemannian Langevin step;
-- metric scale regularization.
+### Gate A: mathematical validity
 
-The module is intentionally independent of the CIFAR/ImageNet model definitions. Existing energy models can be wrapped with a one-argument potential function:
+- prove continuous-time invariance relative to the declared base measure;
+- prove the pointwise SPD representability result and state its global assumptions;
+- specify a gauge-fixed parameterization with explicit eigenvalue bounds;
+- recover Energy Matching exactly when `G = I`.
 
-```python
-potential_fn = lambda x: energy_model.potential(x, time_tensor)
-velocity = riemannian_velocity(potential_fn, mobility, x, create_graph=True)
-```
+### Gate B: controlled synthetic evidence
 
-Run the lightweight unit tests with:
+- recover a constructed non-Euclidean field with known `V_star` and `G_star`;
+- reduce held-out velocity error by at least 25% over parameter-matched Euclidean Energy Matching on a field with verified projection mismatch;
+- match the known stationary density without statistically detectable degradation from the Euclidean chain;
+- demonstrate that omitting `div G` creates the predicted stationary bias.
+
+### Gate C: frozen-energy CIFAR-10
+
+- improve the FID-versus-NFE or FID-versus-wall-clock Pareto frontier using the exact same energy checkpoint;
+- achieve at least 25--30% lower sampling wall-clock/NFE at matched FID, or at least 0.3 lower FID at matched sampling compute;
+- report peak memory and divergence-estimation overhead;
+- show no material precision, recall, or mode-coverage regression.
+
+### Gate D: full paper
+
+- reproduce the main result across at least three training seeds with confidence intervals;
+- beat constant, scalar, parameter-matched, and sampling-only geometry baselines;
+- demonstrate one posterior/inverse-problem setting in which the learned mobility transfers without retraining the energy;
+- report negative results and regimes where geometry does not help.
+
+ImageNet-32 is a scaling experiment after Gate C, not a substitute for mechanism or rigor.
+
+## Experimental program
+
+The full preregistered protocol is in [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md). The primary studies are:
+
+1. analytic vector-field recovery and representability diagnostics;
+2. exact-density and long-chain equilibrium tests;
+3. 2D joint training and geometry visualization;
+4. CIFAR-10 frozen-energy sampling;
+5. CIFAR-10 joint REM training;
+6. posterior sampling for an inverse problem;
+7. optional ImageNet-32 scaling after the central claims pass.
+
+The code-by-code completion state, GPU validation boundary, external baselines, and remaining TODOs are tracked in [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md). This status file is authoritative when the broader protocol mentions an experiment that may not yet have an implementation.
+
+Primary endpoints are selected before runs. Results are reported over fixed seeds with uncertainty, parameter-matched and compute-matched controls, and complete wall-clock/VRAM accounting.
+
+## Positioning against adjacent work
+
+| Method | Single static energy | Learned geometry | OT/transport supervision | Geometry preserves that energy's equilibrium |
+|---|---:|---:|---:|---:|
+| [Energy Matching](https://arxiv.org/abs/2504.10612) | Yes | No | Yes | Yes |
+| [Projected Energy Matching](https://arxiv.org/abs/2607.07749) | Yes | No; auxiliary residual | Yes | Energy remains available |
+| [Riemannian Flow Matching](https://arxiv.org/abs/2302.03660) | No | Generally prescribed/premetric | Yes | Not its objective |
+| [Energy Guided Geometric Flow Matching](https://arxiv.org/abs/2509.25230) | Energy guides geometry | Yes | Yes | No static Boltzmann generator |
+| [CPMLA](https://papers.neurips.cc/paper_files/paper/2025/hash/7f64034009f4a5fa417a57e1a987c5cd-Abstract-Conference.html) | EBM energy | Yes, mirror map | No OT supervision | Sampling objective |
+| **REM (target)** | **Yes** | **Yes, gauge-fixed mobility** | **Yes** | **Yes, with explicit correction** |
+
+[Riemannian Score-Based Generative Modelling](https://arxiv.org/abs/2202.02763) and recent Riemannian metric-learning work address intrinsic manifolds or geometric recovery. REM instead studies whether learned ambient mobility can reconcile transport expressivity with a static Euclidean-density EBM. The paper must preserve this distinction in its title, abstract, and experiments.
+
+## What is currently implemented
+
+The code now covers the preregistered core experiment paths:
+
+- [`rem/geometry.py`](rem/geometry.py): identity, constant, scalar, determinant-one diagonal, unfixed diagonal, full SPD, and diagonal-plus-low-rank mobilities; constructive SPD mapping; descent/conditioning diagnostics; exact-gauge regularization; Hutchinson divergence; and corrected Riemannian Langevin steps.
+- [`rem/networks.py`](rem/networks.py): zero-at-identity MLP/image parameterizations and the composite `REMModel`.
+- [`experiments/synthetic/run_representability.py`](experiments/synthetic/run_representability.py): known-metric recovery, Euclidean projection-gap diagnostics, negative representability controls, `EM/EM-Large/constant/scalar/diagonal/full` comparisons, seeds, checkpoints, and optional field plots.
+- [`experiments/synthetic/run_stationarity.py`](experiments/synthetic/run_stationarity.py): Euclidean, exact-divergence, Hutchinson-probe, and no-divergence chains over step-size grids with KL, MMD, sliced Wasserstein, ESS, R-hat, expectation error, wall-clock, and JVP accounting.
+- [`experiments/toy2d/train_rem_2d.py`](experiments/toy2d/train_rem_2d.py): Energy Matching, frozen-mobility, and joint-refinement stages.
+- [`experiments/cifar10/train_rem.py`](experiments/cifar10/train_rem.py): single-/multi-GPU training for baseline, frozen, joint, `EM-Large`, constant/scalar/diagonal/unfixed/low-rank mobility, trust region, corrected contrastive negatives, EMA, and resumable checkpoints.
+- [`experiments/cifar10/evaluate_rem.py`](experiments/cifar10/evaluate_rem.py): 50k FID/KID/precision/recall sweeps versus NFE, divergence JVPs, wall-clock, throughput, and peak memory.
+- [`experiments/cifar10/match_capacity.py`](experiments/cifar10/match_capacity.py): parameter matching for `EM-Large`.
+- [`experiments/inverse/run_cifar_inverse.py`](experiments/inverse/run_cifar_inverse.py): frozen-mobility transfer to inpainting, super-resolution, and deblurring with reconstruction, consistency, diversity, coverage, and runtime metrics.
+- [`experiments/run_ablation_suite.py`](experiments/run_ablation_suite.py): reproducible three-seed ablation command generation/execution from [`configs/cifar10_ablation.json`](configs/cifar10_ablation.json).
+- [`experiments/aggregate_results.py`](experiments/aggregate_results.py) and [`experiments/check_claim_gates.py`](experiments/check_claim_gates.py): seed aggregation, bootstrap confidence intervals, CSV/JSON export, and nonzero-exit claim threshold checks.
+
+`REM-Full` is deliberately restricted to dimensions at most 64. A dense `3072 x 3072` CIFAR mobility would be an impractical and misleading baseline; CIFAR uses determinant-one diagonal and diagonal-plus-low-rank variants instead. CPMLA and PEM remain external comparison methods: they should only be reported after their official implementations are run under the same checkpoint and compute protocol, rather than approximated under those names here.
+
+The code paths have CPU unit/smoke coverage, but CIFAR FID, multi-GPU equivalence, CUDA memory, and the paper thresholds require actual server runs. “Implemented” therefore means the experiment can be launched and audited, not that its scientific gate has passed.
+
+## Run order
+
+Run the inexpensive validity gates before committing to full CIFAR training:
 
 ```bash
 python -m unittest discover -s tests -v
+python -m experiments.synthetic.run_representability \
+  --problem rotating --variants em,em-large,constant,scalar,diagonal,full \
+  --seeds 0,1,2,3,4 --steps 5000 --learn-energy --plot
+python -m experiments.synthetic.run_representability \
+  --problem rotating --variants constant,scalar,diagonal,full \
+  --seeds 0,1,2,3,4 --steps 5000 --no-learn-energy --plot
+python -m experiments.synthetic.run_stationarity \
+  --variants euclidean,rem-exact,rem-hutch-1,rem-hutch-4,rem-no-div \
+  --seeds 0,1,2,3,4
 ```
 
-## Integration map
+After selecting a frozen upstream Energy Matching checkpoint:
 
-The imported Energy Matching baseline has three main insertion points:
-
-1. **Toy transport:** replace `velocity_training` and `velocity_inference` in `experiments/toy2d/utils_2D.py` with `riemannian_velocity`.
-2. **Negative sampling:** replace the Euclidean update in `gibbs_sampler` and `utils_cifar_imagenet.gibbs_sampling_time_sweep` with `riemannian_langevin_step`.
-3. **CIFAR/ImageNet transport loss:** instantiate a mobility network next to `EBViTModelWrapper`, include its parameters in DDP/Adam/EMA/checkpoints, and compute `L_ROT` in `forward_all`.
-
-The first experimental implementation will stay diagonal. A diagonal-plus-low-rank mobility
-
-```math
-G_\phi(x)=D_\phi(x)+U_\phi(x)U_\phi(x)^\top
+```bash
+python -m experiments.cifar10.match_capacity --mobility diagonal
+python -m experiments.run_ablation_suite configs/cifar10_ablation.json \
+  --gpus 2 --energy-checkpoint /path/to/em.pt --output outputs \
+  --em-large-multiplier <reported_multiplier>
+python -m experiments.run_ablation_suite configs/cifar10_ablation.json \
+  --gpus 2 --energy-checkpoint /path/to/em.pt --output outputs \
+  --em-large-multiplier <reported_multiplier> --execute
 ```
 
-is deferred until the diagonal pilot verifies the hypothesis.
+The manifest runs frozen `REM-Diag` before joint REM and automatically loads the same seed's frozen checkpoint into the joint stage. After measuring joint REM training time, run the separate compute-matched manifest with that preregistered per-run wall-clock budget:
 
-## Research roadmap
+```bash
+python -m experiments.run_ablation_suite configs/cifar10_compute_matched.json \
+  --gpus 2 --output outputs --compute-matched-seconds <seconds> --execute
+```
 
-### Phase 0 - Baseline and geometry scaffold
+Evaluate every selected checkpoint at the same preregistered sampler grid. `REM-NoDiv` deliberately reuses the exact `REM-Diag` checkpoint and only removes the sampler correction:
 
-- [x] Import the official Energy Matching repository.
-- [x] Preserve the upstream MIT license and attribution.
-- [x] Add bounded diagonal mobility primitives.
-- [x] Add equilibrium-correct Riemannian Langevin dynamics.
-- [x] Add unit tests for the Euclidean limit and divergence correction.
+```bash
+python -m experiments.run_evaluation_suite configs/cifar10_evaluation.json \
+  --training-output outputs --output outputs/evaluation --execute
+python -m experiments.aggregate_results outputs/evaluation \
+  --group-by variant,steps \
+  --metrics fid,kid_mean,precision,recall,sampling_wall_seconds,peak_memory_bytes \
+  --json-out outputs/cifar_aggregate.json \
+  --csv-out outputs/cifar_aggregate.csv
+```
 
-### Phase 1 - Controlled 2D study
+Copy [`configs/claim_gates.example.json`](configs/claim_gates.example.json), preregister the target FID/wall-clock values before inspecting final test results, and run:
 
-- [ ] Integrate REM into the Eight-Gaussians-to-Two-Moons experiment.
-- [ ] Implement a full `2 x 2` SPD mobility using a Cholesky parameterization.
-- [ ] Compare `G=I`, constant diagonal, state-dependent diagonal, and full SPD variants.
-- [ ] Verify equilibrium against known densities with KL, MMD, and long-run chains.
-- [ ] Ablate exact, Hutchinson, and omitted divergence corrections.
-- [ ] Track transport residual, eigenvalues, and metric condition number.
+```bash
+python -m experiments.check_claim_gates \
+  outputs/cifar_aggregate.json configs/claim_gates.json \
+  --report outputs/claim_gate_report.json
+```
 
-### Phase 2 - CIFAR-10 frozen-energy pilot
+## Reproducibility contract
 
-- [ ] Load the official Energy Matching checkpoint and freeze `V_theta`.
-- [ ] Train only a small diagonal mobility network from OT transport supervision.
-- [ ] Measure whether the learned geometry reduces transport error.
-- [ ] Compare FID/KID, precision/recall, wall-clock time, and NFE.
-- [ ] Stop if transport error does not improve by at least 20% or the metric collapses.
+Every reported run must record:
 
-### Phase 3 - Joint REM training
+- Git commit and full resolved configuration;
+- training and evaluation seeds;
+- dataset version and preprocessing hash;
+- global and per-device batch size;
+- GPU model/count, peak VRAM, training GPU-hours, and sampling wall-clock;
+- checkpoint-selection rule fixed before test evaluation;
+- raw per-seed metrics, not only the best run.
 
-- [ ] Jointly train `V_theta` and `G_phi` in Phase 1 warm-up.
-- [ ] Use Riemannian negatives during contrastive Phase 2.
-- [ ] Add mobility parameters to EMA and checkpoint handling.
-- [ ] Evaluate long-run stability from both noise and data initialization.
-- [ ] Compare diagonal and diagonal-plus-low-rank mobilities.
-
-### Phase 4 - Theory and broader evaluation
-
-- [ ] Formalize the generalized/weighted Wasserstein JKO interpretation.
-- [ ] Prove invariance of the Boltzmann density.
-- [ ] Characterize descent vector fields representable as `-G grad V`.
-- [ ] Study convergence under uniform ellipticity bounds.
-- [ ] Evaluate ImageNet32 and at least one inverse problem.
-
-## Primary success criteria
-
-The project should demonstrate at least one of:
-
-- at least 30% fewer sampling steps at matched FID;
-- at least 0.2 CIFAR-10 FID improvement at matched compute;
-- at least 20% lower transport regression error with stable metric conditioning;
-- materially better effective sample size or mode coverage at the same stationary density.
+All main tables will report uncertainty. Hyperparameters are tuned on validation criteria and frozen before final test evaluation.
 
 ## Setup
 
-The baseline follows the upstream CUDA setup:
+The baseline currently follows the upstream CUDA environment:
 
 ```bash
 conda create -n rem python=3.10 -y
 conda activate rem
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
+python -m unittest discover -s tests -v
 ```
-
-The original training entry points remain available under `experiments/`. Until the REM integration flags land, they reproduce standard Energy Matching rather than REM.
-
-## Prior and adjacent work
-
-- [Energy Matching](https://arxiv.org/abs/2504.10612) provides the static scalar-energy baseline.
-- [Projected Energy Matching](https://arxiv.org/abs/2607.07749) studies conservative-field mismatch and negative caching.
-- [Convex Potential Mirror Langevin Algorithm](https://openreview.net/forum?id=oiDvwOhvjq) applies learned mirror geometry to EBM sampling. REM differs by learning geometry directly from Energy Matching transport supervision and using the same geometry during training and equilibrium sampling.
-- [Energy Guided Geometric Flow Matching](https://openreview.net/forum?id=5NpCMdGy1A) uses learned geometry to guide flow trajectories, but does not retain REM's single static Boltzmann energy objective.
 
 ## Upstream attribution
 
-This repository is based on the official [`m1balcerak/EnergyMatching`](https://github.com/m1balcerak/EnergyMatching) repository at commit `18176e4222a32dc9d2b323e92e8ff96e686ef2b2`. The imported code and media remain under the upstream MIT license. REM-specific changes are documented through this repository's Git history.
-
-If you use the baseline, please cite the original work:
+This repository is based on the official [`m1balcerak/EnergyMatching`](https://github.com/m1balcerak/EnergyMatching) repository at commit `18176e4222a32dc9d2b323e92e8ff96e686ef2b2`. Imported code and media retain the upstream MIT license.
 
 ```bibtex
 @inproceedings{balcerak2025energy,

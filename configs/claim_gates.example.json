@@ -1,0 +1,69 @@
+{
+  "requirements": [
+    ["synthetic_velocity_error_25_percent"],
+    ["frozen_cifar_wall_clock_30_percent", "frozen_cifar_fid_0_3"],
+    ["frozen_precision_no_regression"],
+    ["frozen_recall_no_regression"]
+  ],
+  "checks": [
+    {
+      "name": "synthetic_velocity_error_25_percent",
+      "comparison": "relative_improvement",
+      "metric": "relative_velocity_mse",
+      "direction": "lower",
+      "candidate": {"variant": "full"},
+      "baseline": {"variant": "em-large"},
+      "match_on": [],
+      "policy": "all",
+      "threshold": 0.25,
+      "min_count": 5,
+      "require_ci": true
+    },
+    {
+      "name": "frozen_cifar_wall_clock_30_percent",
+      "comparison": "matched_fid_wall_reduction",
+      "candidate": {"variant": "rem_diagonal"},
+      "baseline": {"variant": "em"},
+      "target_fid": 5.0,
+      "threshold": 0.30,
+      "min_count": 3,
+      "require_ci": true
+    },
+    {
+      "name": "frozen_cifar_fid_0_3",
+      "comparison": "matched_wall_fid_improvement",
+      "candidate": {"variant": "rem_diagonal"},
+      "baseline": {"variant": "em"},
+      "target_wall_seconds": 1000.0,
+      "threshold": 0.30,
+      "min_count": 3,
+      "require_ci": true
+    },
+    {
+      "name": "frozen_precision_no_regression",
+      "comparison": "absolute_improvement",
+      "metric": "precision",
+      "direction": "higher",
+      "candidate": {"variant": "rem_diagonal"},
+      "baseline": {"variant": "em"},
+      "match_on": ["steps"],
+      "policy": "all",
+      "threshold": -0.01,
+      "min_count": 3,
+      "require_ci": true
+    },
+    {
+      "name": "frozen_recall_no_regression",
+      "comparison": "absolute_improvement",
+      "metric": "recall",
+      "direction": "higher",
+      "candidate": {"variant": "rem_diagonal"},
+      "baseline": {"variant": "em"},
+      "match_on": ["steps"],
+      "policy": "all",
+      "threshold": -0.01,
+      "min_count": 3,
+      "require_ci": true
+    }
+  ]
+}

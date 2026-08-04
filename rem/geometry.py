@@ -12,6 +12,7 @@ regularity and integrability assumptions.
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional
 
 import torch
@@ -21,8 +22,24 @@ from torch import Tensor, nn
 PotentialFn = Callable[[Tensor], Tensor]
 
 
+def _flatten_batch(value: Tensor) -> Tensor:
+    if value.ndim < 2:
+        raise ValueError("REM tensors must include a batch dimension")
+    return value.reshape(value.shape[0], -1)
+
+
+def _restore_batch(value: Tensor, reference: Tensor) -> Tensor:
+    return value.reshape_as(reference)
+
+
+def _batch_scalar_like(value: Tensor, reference: Tensor) -> Tensor:
+    return value.reshape(value.shape[0], *([1] * (reference.ndim - 1)))
+
+
 class IdentityMobility(nn.Module):
     """Euclidean mobility ``G(x) = I`` used by standard Energy Matching."""
+
+    divergence_probe_cost = 0
 
     def apply(self, x: Tensor, vector: Tensor) -> Tensor:
         del x
@@ -32,8 +49,15 @@ class IdentityMobility(nn.Module):
         del x
         return noise
 
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        del x
+        return vector
+
     def diagonal(self, x: Tensor) -> Tensor:
         return torch.ones_like(x)
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
 
     def divergence(
         self,
@@ -86,6 +110,533 @@ class DiagonalMobility(nn.Module):
 
     def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
         return self.diagonal(x).sqrt() * noise
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return vector / self.diagonal(x)
+
+    def log_diagonal(self, x: Tensor) -> Tensor:
+        return self.diagonal(x).log()
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return _flatten_batch(self.log_diagonal(x)).sum(dim=1)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        return hutchinson_divergence(
+            self,
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+
+
+class GaugeFixedDiagonalMobility(nn.Module):
+    """State-dependent diagonal mobility with an exact determinant-one gauge.
+
+    The network produces unconstrained logits with the same shape as ``x``.
+    Log-mobilities are smoothly bounded and centered over event dimensions,
+    making ``log det G(x) = 0`` for every sample. If ``log_bound`` is ``a``,
+    the centered log-eigenvalues lie in ``[-2a, 2a]``.
+    """
+
+    def __init__(self, logit_network: nn.Module, *, log_bound: float = 1.5) -> None:
+        super().__init__()
+        if log_bound <= 0:
+            raise ValueError("log_bound must be positive")
+        self.logit_network = logit_network
+        self.log_bound = float(log_bound)
+
+    def log_diagonal(self, x: Tensor) -> Tensor:
+        logits = self.logit_network(x)
+        if logits.shape != x.shape:
+            raise ValueError(
+                "logit_network must preserve the input shape; "
+                f"received input {tuple(x.shape)} and output {tuple(logits.shape)}"
+            )
+        bounded = self.log_bound * torch.tanh(logits)
+        flat = _flatten_batch(bounded)
+        centered = flat - flat.mean(dim=1, keepdim=True)
+        return _restore_batch(centered, x)
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        return self.log_diagonal(x).exp()
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return self.diagonal(x) * vector
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return vector / self.diagonal(x)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        return (0.5 * self.log_diagonal(x)).exp() * noise
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return _flatten_batch(self.log_diagonal(x)).sum(dim=1)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        return hutchinson_divergence(
+            self,
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+
+
+class UnfixedLogDiagonalMobility(nn.Module):
+    """Bounded log-diagonal mobility without determinant gauge fixing.
+
+    This module is intentionally provided only for the ``REM-Unfixed``
+    identifiability ablation. Zero network output still gives ``G = I``, but
+    the state-dependent scalar degree of freedom is left unconstrained so the
+    experiment can directly measure scale drift and seed instability.
+    """
+
+    def __init__(self, logit_network: nn.Module, *, log_bound: float = 1.5) -> None:
+        super().__init__()
+        if log_bound <= 0:
+            raise ValueError("log_bound must be positive")
+        self.logit_network = logit_network
+        self.log_bound = float(log_bound)
+
+    def log_diagonal(self, x: Tensor) -> Tensor:
+        logits = self.logit_network(x)
+        if logits.shape != x.shape:
+            raise ValueError(
+                "logit_network must preserve the input shape; "
+                f"received input {tuple(x.shape)} and output {tuple(logits.shape)}"
+            )
+        return self.log_bound * torch.tanh(logits)
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        return self.log_diagonal(x).exp()
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return self.diagonal(x) * vector
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return vector / self.diagonal(x)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        return (0.5 * self.log_diagonal(x)).exp() * noise
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return _flatten_batch(self.log_diagonal(x)).sum(dim=1)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        return hutchinson_divergence(
+            self,
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+
+
+class BoundedScalarMobility(nn.Module):
+    """State-dependent isotropic mobility used as a step-size control.
+
+    A nontrivial scalar mobility cannot simultaneously have pointwise
+    determinant one, so this ablation is anchored by an explicit scale
+    regularizer instead of the REM gauge.
+    """
+
+    def __init__(
+        self,
+        logit_network: nn.Module,
+        *,
+        min_mobility: float = 0.25,
+        max_mobility: float = 4.0,
+    ) -> None:
+        super().__init__()
+        if (
+            min_mobility <= 0
+            or max_mobility <= min_mobility
+            or not min_mobility < 1.0 < max_mobility
+        ):
+            raise ValueError("scalar bounds must satisfy 0 < min < 1 < max")
+        self.logit_network = logit_network
+        self.min_mobility = float(min_mobility)
+        self.max_mobility = float(max_mobility)
+        log_min = math.log(self.min_mobility)
+        log_max = math.log(self.max_mobility)
+        unit_position = -log_min / (log_max - log_min)
+        self.logit_offset = math.log(unit_position / (1 - unit_position))
+
+    def scale(self, x: Tensor) -> Tensor:
+        logits = self.logit_network(x)
+        if logits.shape == x.shape:
+            logits = _flatten_batch(logits).mean(dim=1)
+        elif logits.ndim == 2 and logits.shape[1] == 1:
+            logits = logits[:, 0]
+        elif logits.ndim != 1 or logits.shape[0] != x.shape[0]:
+            raise ValueError("scalar logit network must return (B,), (B,1), or x.shape")
+        log_min = math.log(self.min_mobility)
+        log_range = math.log(self.max_mobility) - log_min
+        log_scale = log_min + log_range * torch.sigmoid(logits + self.logit_offset)
+        return log_scale.exp()
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        return torch.ones_like(x) * _batch_scalar_like(self.scale(x), x)
+
+    def log_diagonal(self, x: Tensor) -> Tensor:
+        return self.diagonal(x).log()
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return _batch_scalar_like(self.scale(x), x) * vector
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return vector / _batch_scalar_like(self.scale(x), x)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        return _batch_scalar_like(self.scale(x).sqrt(), x) * noise
+
+    def logdet(self, x: Tensor) -> Tensor:
+        dimension = _flatten_batch(x).shape[1]
+        return dimension * self.scale(x).log()
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        return hutchinson_divergence(
+            self,
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+
+
+class ConstantDiagonalMobility(nn.Module):
+    """Learnable constant diagonal preconditioner with optional gauge fixing."""
+
+    divergence_probe_cost = 0
+
+    def __init__(
+        self,
+        dimension: int,
+        *,
+        log_bound: float = 1.5,
+        gauge_fixed: bool = True,
+    ) -> None:
+        super().__init__()
+        if dimension < 1 or log_bound <= 0:
+            raise ValueError("dimension and log_bound must be positive")
+        self.dimension = int(dimension)
+        self.log_bound = float(log_bound)
+        self.gauge_fixed = bool(gauge_fixed)
+        self.raw_log_diagonal = nn.Parameter(torch.zeros(dimension))
+
+    def _logs(self, x: Tensor) -> Tensor:
+        if _flatten_batch(x).shape[1] != self.dimension:
+            raise ValueError("input dimension does not match constant mobility")
+        logs = self.log_bound * torch.tanh(self.raw_log_diagonal)
+        if self.gauge_fixed:
+            logs = logs - logs.mean()
+        return logs.unsqueeze(0).expand(x.shape[0], -1)
+
+    def log_diagonal(self, x: Tensor) -> Tensor:
+        return _restore_batch(self._logs(x), x)
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        return self.log_diagonal(x).exp()
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return self.diagonal(x) * vector
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return vector / self.diagonal(x)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        return (0.5 * self.log_diagonal(x)).exp() * noise
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return self._logs(x).sum(dim=1)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        del n_samples, create_graph
+        return torch.zeros_like(x)
+
+
+class GaugeFixedFullMobility(nn.Module):
+    """Full SPD mobility for low-dimensional controlled experiments.
+
+    The network may return ``(B,d,d)``, ``(B,d*d)``, or packed lower-triangle
+    values ``(B,d*(d+1)/2)``. Its symmetric output is spectrally squashed,
+    made traceless, and exponentiated. Consequently the mobility is SPD and
+    has determinant one by construction.
+    """
+
+    def __init__(
+        self,
+        matrix_network: nn.Module,
+        dimension: int,
+        *,
+        log_eigenvalue_bound: float = 1.5,
+    ) -> None:
+        super().__init__()
+        if dimension < 1 or log_eigenvalue_bound <= 0:
+            raise ValueError("dimension and log_eigenvalue_bound must be positive")
+        self.matrix_network = matrix_network
+        self.dimension = int(dimension)
+        self.log_eigenvalue_bound = float(log_eigenvalue_bound)
+
+    def _raw_matrix(self, x: Tensor) -> Tensor:
+        raw = self.matrix_network(x)
+        batch = x.shape[0]
+        dimension = self.dimension
+        if raw.shape == (batch, dimension, dimension):
+            return raw
+        if raw.shape == (batch, dimension * dimension):
+            return raw.reshape(batch, dimension, dimension)
+        packed_size = dimension * (dimension + 1) // 2
+        if raw.shape == (batch, packed_size):
+            matrix = raw.new_zeros(batch, dimension, dimension)
+            rows, cols = torch.tril_indices(dimension, dimension, device=raw.device)
+            matrix[:, rows, cols] = raw
+            return matrix
+        raise ValueError(
+            "full mobility network must return (B,d,d), (B,d*d), or "
+            "(B,d*(d+1)/2)"
+        )
+
+    def log_matrix(self, x: Tensor) -> Tensor:
+        if _flatten_batch(x).shape[1] != self.dimension:
+            raise ValueError("input dimension does not match full mobility")
+        raw = self._raw_matrix(x)
+        symmetric = 0.5 * (raw + raw.transpose(-1, -2))
+        trace = torch.diagonal(symmetric, dim1=-2, dim2=-1).sum(dim=1)
+        identity = torch.eye(
+            self.dimension, device=x.device, dtype=x.dtype
+        ).unsqueeze(0)
+        traceless = symmetric - (trace / self.dimension).view(-1, 1, 1) * identity
+        squared_frobenius = traceless.square().sum(dim=(1, 2), keepdim=True)
+        denominator = (
+            self.log_eigenvalue_bound ** 2 + squared_frobenius
+        ).sqrt()
+        return self.log_eigenvalue_bound * traceless / denominator
+
+    def log_eigendecomposition(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        return torch.linalg.eigh(self.log_matrix(x))
+
+    def matrix(self, x: Tensor) -> Tensor:
+        return torch.matrix_exp(self.log_matrix(x))
+
+    def log_eigenvalues(self, x: Tensor) -> Tensor:
+        return self.log_eigendecomposition(x)[0]
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        diagonal = torch.diagonal(self.matrix(x), dim1=-2, dim2=-1)
+        return _restore_batch(diagonal, x)
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        flat = _flatten_batch(vector).unsqueeze(-1)
+        result = self.matrix(x) @ flat
+        return _restore_batch(result.squeeze(-1), vector)
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        matrix_inverse = torch.matrix_exp(-self.log_matrix(x))
+        result = matrix_inverse @ _flatten_batch(vector).unsqueeze(-1)
+        return _restore_batch(result.squeeze(-1), vector)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        matrix_sqrt = torch.matrix_exp(0.5 * self.log_matrix(x))
+        result = matrix_sqrt @ _flatten_batch(noise).unsqueeze(-1)
+        return _restore_batch(result.squeeze(-1), noise)
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return torch.diagonal(self.log_matrix(x), dim1=-2, dim2=-1).sum(dim=1)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        return hutchinson_divergence(
+            self,
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+
+
+class DiagonalPlusLowRankMobility(nn.Module):
+    """Scalable determinant-one mobility ``G = D + U U^T``.
+
+    ``parameter_network`` returns ``(B, d * (rank + 1))`` or a tuple
+    ``(diagonal_logits, factors)`` with shapes matching ``x`` and
+    ``(B,d,rank)``. The determinant is normalized using the matrix
+    determinant lemma, without materializing a dense ``d x d`` matrix.
+    """
+
+    def __init__(
+        self,
+        parameter_network: nn.Module,
+        rank: int,
+        *,
+        log_bound: float = 1.5,
+        factor_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if rank < 1 or log_bound <= 0 or factor_scale <= 0:
+            raise ValueError("rank, log_bound, and factor_scale must be positive")
+        self.parameter_network = parameter_network
+        self.rank = int(rank)
+        self.log_bound = float(log_bound)
+        self.factor_scale = float(factor_scale)
+
+    def _raw_components(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        output = self.parameter_network(x)
+        dimension = _flatten_batch(x).shape[1]
+        if isinstance(output, tuple):
+            diagonal_logits, factors = output
+            diagonal_logits = _flatten_batch(diagonal_logits)
+            if factors.shape != (x.shape[0], dimension, self.rank):
+                raise ValueError("low-rank factors must have shape (B,d,rank)")
+        else:
+            expected = dimension * (self.rank + 1)
+            if output.shape != (x.shape[0], expected):
+                raise ValueError(
+                    f"low-rank network must return (B,{expected}) for this input"
+                )
+            diagonal_logits = output[:, :dimension]
+            factors = output[:, dimension:].reshape(x.shape[0], dimension, self.rank)
+        return diagonal_logits, factors
+
+    def components(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        diagonal_logits, raw_factors = self._raw_components(x)
+        bounded = self.log_bound * torch.tanh(diagonal_logits)
+        base_logs = bounded - bounded.mean(dim=1, keepdim=True)
+        base_diagonal = base_logs.exp()
+        factors = (
+            self.factor_scale
+            * torch.tanh(raw_factors)
+            / (self.rank ** 0.5)
+        )
+
+        inverse_diagonal_factors = factors / base_diagonal.unsqueeze(-1)
+        small = torch.eye(
+            self.rank,
+            device=x.device,
+            dtype=x.dtype,
+        ).unsqueeze(0) + factors.transpose(1, 2) @ inverse_diagonal_factors
+        total_logdet = base_logs.sum(dim=1) + torch.linalg.slogdet(small).logabsdet
+        scale = torch.exp(-total_logdet / base_diagonal.shape[1])
+        return scale.unsqueeze(1) * base_diagonal, scale.sqrt().view(-1, 1, 1) * factors
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        diagonal, factors = self.components(x)
+        result = diagonal + factors.square().sum(dim=-1)
+        return _restore_batch(result, x)
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        diagonal, factors = self.components(x)
+        flat = _flatten_batch(vector)
+        result = diagonal * flat + torch.bmm(
+            factors,
+            torch.bmm(factors.transpose(1, 2), flat.unsqueeze(-1)),
+        ).squeeze(-1)
+        return _restore_batch(result, vector)
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        diagonal, factors = self.components(x)
+        flat = _flatten_batch(vector)
+        diagonal_inverse = diagonal.reciprocal()
+        dinv_vector = diagonal_inverse * flat
+        dinv_factors = diagonal_inverse.unsqueeze(-1) * factors
+        small = torch.eye(
+            self.rank,
+            device=x.device,
+            dtype=x.dtype,
+        ).unsqueeze(0) + factors.transpose(1, 2) @ dinv_factors
+        correction = torch.linalg.solve(
+            small,
+            torch.bmm(factors.transpose(1, 2), dinv_vector.unsqueeze(-1)),
+        )
+        result = dinv_vector - torch.bmm(dinv_factors, correction).squeeze(-1)
+        return _restore_batch(result, vector)
+
+    def sample_sqrt_noise(
+        self,
+        x: Tensor,
+        *,
+        noise: Optional[Tensor] = None,
+        rank_noise: Optional[Tensor] = None,
+    ) -> Tensor:
+        diagonal, factors = self.components(x)
+        if noise is None:
+            noise = torch.randn_like(x)
+        if noise.shape != x.shape:
+            raise ValueError("noise must have the same shape as x")
+        if rank_noise is None:
+            rank_noise = torch.randn(
+                x.shape[0], self.rank, device=x.device, dtype=x.dtype
+            )
+        if rank_noise.shape != (x.shape[0], self.rank):
+            raise ValueError("rank_noise must have shape (B,rank)")
+        flat = diagonal.sqrt() * _flatten_batch(noise)
+        flat = flat + torch.bmm(factors, rank_noise.unsqueeze(-1)).squeeze(-1)
+        return _restore_batch(flat, x)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        dimension = _flatten_batch(x).shape[1]
+        if dimension > 256:
+            raise RuntimeError(
+                "deterministic dense square-root application is limited to d<=256; "
+                "use sample_sqrt_noise for scalable sampling"
+            )
+        diagonal, factors = self.components(x)
+        dense = torch.diag_embed(diagonal) + factors @ factors.transpose(1, 2)
+        eigenvalues, eigenvectors = torch.linalg.eigh(dense)
+        square_root = (
+            eigenvectors * eigenvalues.clamp_min(0).sqrt().unsqueeze(-2)
+        ) @ eigenvectors.transpose(1, 2)
+        result = square_root @ _flatten_batch(noise).unsqueeze(-1)
+        return _restore_batch(result.squeeze(-1), noise)
+
+    def logdet(self, x: Tensor) -> Tensor:
+        diagonal, factors = self.components(x)
+        inverse_diagonal_factors = factors / diagonal.unsqueeze(-1)
+        small = torch.eye(
+            self.rank,
+            device=x.device,
+            dtype=x.dtype,
+        ).unsqueeze(0) + factors.transpose(1, 2) @ inverse_diagonal_factors
+        return diagonal.log().sum(dim=1) + torch.linalg.slogdet(small).logabsdet
+
+    def distortion_regularizer(self, x: Tensor) -> Tensor:
+        """Scalable near-identity penalty including off-diagonal factors."""
+
+        diagonal, factors = self.components(x)
+        diagonal_penalty = diagonal.log().square().mean()
+        factor_penalty = factors.square().sum(dim=2).mean()
+        return diagonal_penalty + factor_penalty
 
     def divergence(
         self,
@@ -148,9 +699,15 @@ def riemannian_transport_loss(
     x_t: Tensor,
     target_velocity: Tensor,
     *,
+    metric_weighted: bool = False,
     reduction: str = "mean",
 ) -> Tensor:
-    """Squared-error transport loss for Riemannian Energy Matching."""
+    """Transport loss for Riemannian Energy Matching.
+
+    If ``metric_weighted`` is true, each per-sample residual is measured in
+    the inverse-mobility norm. Gauge fixing is required when this option is
+    used with a learned mobility; otherwise the metric could rescale the loss.
+    """
 
     prediction = riemannian_velocity(
         potential_fn,
@@ -158,7 +715,24 @@ def riemannian_transport_loss(
         x_t,
         create_graph=True,
     )
-    error = (prediction - target_velocity).square()
+    residual = prediction - target_velocity
+
+    if metric_weighted:
+        if not hasattr(mobility, "inverse_apply"):
+            raise TypeError("metric-weighted loss requires mobility.inverse_apply")
+        inverse_residual = mobility.inverse_apply(x_t, residual)
+        per_sample = (
+            _flatten_batch(residual) * _flatten_batch(inverse_residual)
+        ).mean(dim=1)
+        if reduction == "mean":
+            return per_sample.mean()
+        if reduction == "sum":
+            return per_sample.sum()
+        if reduction == "none":
+            return per_sample
+        raise ValueError(f"unsupported reduction: {reduction}")
+
+    error = residual.square()
 
     if reduction == "mean":
         return error.mean()
@@ -218,6 +792,136 @@ def hutchinson_divergence(
     return torch.stack(estimates, dim=0).mean(dim=0)
 
 
+def descent_condition_diagnostics(
+    energy_gradient: Tensor,
+    target_velocity: Tensor,
+    *,
+    tolerance: float = 0.0,
+    eps: float = 1e-12,
+) -> dict[str, Tensor]:
+    """Measure the necessary descent condition for an SPD representation.
+
+    For ``u = -G grad(V)`` with ``G`` SPD, ``u^T grad(V)`` must be negative
+    away from zeros. Returned tensors retain one entry per sample except for
+    ``violation_rate``.
+    """
+
+    if energy_gradient.shape != target_velocity.shape:
+        raise ValueError("energy_gradient and target_velocity must have equal shapes")
+    gradient_flat = _flatten_batch(energy_gradient)
+    velocity_flat = _flatten_batch(target_velocity)
+    signed_dot = (gradient_flat * velocity_flat).sum(dim=1)
+    gradient_norm = gradient_flat.norm(dim=1)
+    velocity_norm = velocity_flat.norm(dim=1)
+    active = (gradient_norm > eps) & (velocity_norm > eps)
+    violation = active & (signed_dot >= -tolerance)
+    denominator = (gradient_norm * velocity_norm).clamp_min(eps)
+    cosine = signed_dot / denominator
+    if active.any():
+        violation_rate = violation[active].to(gradient_flat.dtype).mean()
+    else:
+        violation_rate = gradient_flat.new_tensor(float("nan"))
+    return {
+        "signed_dot": signed_dot,
+        "cosine": cosine,
+        "active": active,
+        "violation": violation,
+        "violation_rate": violation_rate,
+    }
+
+
+def construct_spd_mapping(
+    energy_gradient: Tensor,
+    target_velocity: Tensor,
+    *,
+    perpendicular_regularization: float = 1.0,
+    descent_margin: float = 1e-8,
+) -> tuple[Tensor, Tensor]:
+    """Construct an SPD matrix satisfying ``G grad(V) = -u`` pointwise.
+
+    The construction is valid when ``-u`` has a strictly positive inner
+    product with ``grad(V)``. Invalid samples receive the identity matrix and
+    are marked false in the returned validity mask. Under a uniform descent
+    margin and bounded vector norms, the construction is uniformly bounded.
+    """
+
+    if energy_gradient.shape != target_velocity.shape:
+        raise ValueError("energy_gradient and target_velocity must have equal shapes")
+    if perpendicular_regularization <= 0 or descent_margin < 0:
+        raise ValueError("regularization must be positive and margin nonnegative")
+
+    gradient = _flatten_batch(energy_gradient)
+    mapped = -_flatten_batch(target_velocity)
+    batch, dimension = gradient.shape
+    norm = gradient.norm(dim=1)
+    inner = (gradient * mapped).sum(dim=1)
+    valid = (norm > descent_margin) & (inner > descent_margin)
+    safe_norm = norm.clamp_min(max(descent_margin, torch.finfo(norm.dtype).eps))
+    unit = gradient / safe_norm.unsqueeze(1)
+    coefficient = inner / safe_norm.square()
+    safe_coefficient = coefficient.clamp_min(
+        max(descent_margin, torch.finfo(coefficient.dtype).eps)
+    )
+    perpendicular = mapped / safe_norm.unsqueeze(1) - coefficient.unsqueeze(1) * unit
+
+    identity = torch.eye(dimension, device=gradient.device, dtype=gradient.dtype)
+    identity = identity.unsqueeze(0).expand(batch, -1, -1)
+    unit_outer = unit.unsqueeze(2) * unit.unsqueeze(1)
+    cross = unit.unsqueeze(2) * perpendicular.unsqueeze(1)
+    cross = cross + perpendicular.unsqueeze(2) * unit.unsqueeze(1)
+    perpendicular_scale = (
+        perpendicular.square().sum(dim=1) / safe_coefficient
+        + perpendicular_regularization
+    )
+    matrix = (
+        safe_coefficient.view(-1, 1, 1) * unit_outer
+        + cross
+        + perpendicular_scale.view(-1, 1, 1) * (identity - unit_outer)
+    )
+    matrix = torch.where(valid.view(-1, 1, 1), matrix, identity)
+    return matrix, valid
+
+
+def minimal_distortion_regularizer(mobility: nn.Module, x: Tensor) -> Tensor:
+    """Squared log-eigenvalue distance from the Euclidean mobility."""
+
+    if hasattr(mobility, "distortion_regularizer"):
+        return mobility.distortion_regularizer(x)
+    if hasattr(mobility, "log_eigenvalues"):
+        logs = mobility.log_eigenvalues(x)
+    elif hasattr(mobility, "log_matrix"):
+        logs = mobility.log_matrix(x)
+    elif hasattr(mobility, "log_diagonal"):
+        logs = _flatten_batch(mobility.log_diagonal(x))
+    else:
+        logs = _flatten_batch(mobility.diagonal(x).clamp_min(1e-12).log())
+    return logs.square().mean()
+
+
+def mobility_diagnostics(mobility: nn.Module, x: Tensor) -> dict[str, Tensor]:
+    """Return per-sample gauge and conditioning diagnostics."""
+
+    if hasattr(mobility, "log_eigenvalues"):
+        log_eigenvalues = mobility.log_eigenvalues(x)
+        eigenvalues = log_eigenvalues.exp()
+    else:
+        eigenvalues = _flatten_batch(mobility.diagonal(x))
+        log_eigenvalues = eigenvalues.clamp_min(1e-12).log()
+    minimum = eigenvalues.min(dim=1).values
+    maximum = eigenvalues.max(dim=1).values
+    if hasattr(mobility, "logdet"):
+        logdet = mobility.logdet(x)
+    else:
+        logdet = log_eigenvalues.sum(dim=1)
+    return {
+        "logdet": logdet,
+        "min_eigenvalue": minimum,
+        "max_eigenvalue": maximum,
+        "condition_number": maximum / minimum.clamp_min(1e-12),
+        "log_distance_from_identity": log_eigenvalues.square().mean(dim=1).sqrt(),
+    }
+
+
 def _as_batch_scalar(value: float | Tensor, reference: Tensor) -> Tensor:
     tensor = torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
     if tensor.ndim == 0:
@@ -264,12 +968,14 @@ def riemannian_langevin_step(
             )
             drift = drift + epsilon_tensor * divergence
 
-        if noise is None:
-            noise = torch.randn_like(x_for_grad)
-        elif noise.shape != x_for_grad.shape:
-            raise ValueError("noise must have the same shape as x")
-
-        diffusion = mobility.sqrt_apply(x_for_grad, noise)
+        if hasattr(mobility, "sample_sqrt_noise"):
+            diffusion = mobility.sample_sqrt_noise(x_for_grad, noise=noise)
+        else:
+            if noise is None:
+                noise = torch.randn_like(x_for_grad)
+            elif noise.shape != x_for_grad.shape:
+                raise ValueError("noise must have the same shape as x")
+            diffusion = mobility.sqrt_apply(x_for_grad, noise)
         noise_scale = torch.sqrt(2.0 * epsilon_tensor * dt)
         updated = x_for_grad + dt * drift + noise_scale * diffusion
 

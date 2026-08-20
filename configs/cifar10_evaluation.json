@@ -1,7 +1,11 @@
 {
   "module": "experiments.cifar10.evaluate_rem",
   "shared": {
-    "steps": "10,20,50,100,200",
+    "steps": "10,20,50,100,200,325",
+    "t-end": 3.25,
+    "time-cutoff": 1.0,
+    "temperature-ramp-end": 1.0,
+    "temperature-schedule": "official",
     "samples": 50000,
     "batch-size": 128,
     "warmup-batches": 1,

@@ -67,9 +67,6 @@ class ImageNet32Dataset(Dataset):
             x = d['data']          # shape: (N, 3072)
             labels = d['labels']   # list of length N
 
-            # Convert to float and scale to [0..1]
-            x = x.astype(np.float32) / 255.0
-
             # Reshape (N, 3072) -> (N, 3, 32, 32)
             N = x.shape[0]
             x = x.reshape(N, 3, 32, 32)
@@ -100,6 +97,10 @@ class ImageNet32Dataset(Dataset):
             # e.g. transforms.ToTensor() -> returns a FloatTensor (C, H, W)
             # e.g. transforms.RandomHorizontalFlip() -> expects HWC or PIL
             img = self.transform(img)
+        else:
+            # Preserve the documented [0, 1] return contract without storing
+            # the full 1.28M-image dataset as float32 in host memory.
+            img = img.astype(np.float32) / 255.0
 
         return img, label
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping
 
 import torch
@@ -68,6 +70,7 @@ def rem_objective(
     x_transport: Tensor,
     target_velocity: Tensor,
     *,
+    time: Tensor | None = None,
     x_positive: Tensor | None = None,
     x_negative_init: Tensor | None = None,
     transport_weight: float = 1.0,
@@ -82,8 +85,13 @@ def rem_objective(
     negative_clamp: tuple[float, float] | None = None,
     trim_high_fraction: float = 0.0,
 ) -> tuple[LossBreakdown, Tensor | None]:
+    potential_fn = (
+        energy
+        if time is None
+        else lambda value: energy_value(energy, value, time)
+    )
     transport = riemannian_transport_loss(
-        energy,
+        potential_fn,
         mobility,
         x_transport,
         target_velocity,
@@ -115,7 +123,7 @@ def rem_objective(
         negative_energy = trimmed_mean(negative_values, trim_high_fraction)
         contrastive = positive_energy - negative_energy
 
-    gradient = energy_gradient(energy, x_transport)
+    gradient = energy_gradient(energy, x_transport, time)
     descent = descent_condition_diagnostics(gradient, target_velocity)
     total = (
         transport_weight * transport
@@ -206,7 +214,32 @@ def save_rem_checkpoint(
         "mobility_ema": ema_mobility.state_dict() if ema_mobility is not None else None,
         "extra": dict(extra or {}),
     }
-    torch.save(state, path)
+    # Checkpoint writes can fail part-way through on the shared project
+    # filesystem (for example when a project quota is reached).  Writing
+    # directly to the final name leaves behind a deceptively valid-looking
+    # 64-byte/truncated file which can later be mistaken for a resumable
+    # checkpoint.  Stage the archive in the same directory and publish it
+    # atomically only after torch.save has completed.
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+        torch.save(state, temp_path)
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def load_rem_checkpoint(

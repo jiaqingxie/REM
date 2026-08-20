@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from experiments.cifar10.evaluate_rem import load_models
 from rem.artifacts import RunArtifacts, seed_everything
-from rem.geometry import IdentityMobility
+from rem.geometry import IdentityMobility, TemperedDiagonalMobility
 from rem.inverse import (
     DownsampleOperator,
     GaussianBlurOperator,
@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.01)
     parser.add_argument("--observation-sigma", type=float, default=0.05)
     parser.add_argument("--divergence-samples", type=int, default=1)
+    parser.add_argument(
+        "--mobility-strength",
+        type=float,
+        default=1.0,
+        help="Geodesic REM/identity blend; 0 is exactly Euclidean and 1 is full REM",
+    )
     parser.add_argument(
         "--diagnostic-thin",
         type=int,
@@ -127,7 +133,9 @@ def evaluate_variant(args, artifacts, energy, mobility, variant: str):
     if variant == "euclidean":
         evaluation_mobility = IdentityMobility().to(device)
     elif variant == "rem":
-        evaluation_mobility = mobility
+        evaluation_mobility = TemperedDiagonalMobility(
+            mobility, args.mobility_strength
+        )
     else:
         raise ValueError(f"unknown inverse variant: {variant}")
 
@@ -251,7 +259,9 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
     device = torch.device(args.device)
-    energy, mobility, checkpoint = load_models(args.checkpoint, device, args.use_ema)
+    energy, mobility, checkpoint, state_selection = load_models(
+        args.checkpoint, device, args.use_ema
+    )
     variants = [value.strip() for value in args.variants.split(",") if value.strip()]
     experiment_id = args.experiment_id or (
         f"inverse_{args.task}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -259,7 +269,12 @@ def main() -> None:
     artifacts = RunArtifacts(
         args.output,
         experiment_id,
-        {**vars(args), "variants": variants, "training_config": checkpoint["config"]},
+        {
+            **vars(args),
+            "variants": variants,
+            "training_config": checkpoint["config"],
+            **state_selection,
+        },
         repository_root=Path(__file__).resolve().parents[2],
     )
     results = {

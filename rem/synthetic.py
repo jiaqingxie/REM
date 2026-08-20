@@ -65,6 +65,144 @@ class GaussianMixturePotential(nn.Module):
         )
 
 
+class WarpedGaussianMixturePotential(nn.Module):
+    """Area-preserving nonlinear warp of an equal Gaussian mixture.
+
+    The latent-to-observed map is
+
+    ``x_1 = z_1`` and ``x_2 = z_2 + curvature * z_1**2``.
+
+    Its Jacobian determinant is one, so the observed-space potential is the
+    latent mixture potential evaluated at the analytic inverse map.  This
+    gives an exactly sampleable target whose equilibrium is unchanged across
+    mobility ablations while its coordinate geometry can be made harder.
+    """
+
+    def __init__(
+        self,
+        means: Tensor,
+        *,
+        curvature: float,
+        component_variance: float = 0.25,
+        equilibrium_temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.curvature = float(curvature)
+        self.latent_potential = GaussianMixturePotential(
+            means,
+            component_variance=component_variance,
+            equilibrium_temperature=equilibrium_temperature,
+        )
+
+    @property
+    def means(self) -> Tensor:
+        return self.latent_potential.means
+
+    @property
+    def component_variance(self) -> float:
+        return self.latent_potential.component_variance
+
+    def inverse_warp(self, x: Tensor) -> Tensor:
+        if x.shape[-1] != 2:
+            raise ValueError("warped mixture is two-dimensional")
+        return torch.stack(
+            [x[:, 0], x[:, 1] - self.curvature * x[:, 0].square()], dim=1
+        )
+
+    def warp(self, z: Tensor) -> Tensor:
+        if z.shape[-1] != 2:
+            raise ValueError("warped mixture is two-dimensional")
+        return torch.stack(
+            [z[:, 0], z[:, 1] + self.curvature * z[:, 0].square()], dim=1
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.latent_potential(self.inverse_warp(x))
+
+    def sample(
+        self,
+        count: int,
+        *,
+        generator: torch.Generator | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> Tensor:
+        target_device = torch.device(device) if device is not None else self.means.device
+        target_dtype = dtype if dtype is not None else self.means.dtype
+        means = self.means.to(device=target_device, dtype=target_dtype)
+        indices = torch.randint(
+            means.shape[0], (count,), device=target_device, generator=generator
+        )
+        noise = torch.randn(
+            count, 2, device=target_device, dtype=target_dtype, generator=generator
+        )
+        latent = means[indices] + self.component_variance**0.5 * noise
+        return self.warp(latent)
+
+
+class AnalyticWarpMobility(nn.Module):
+    """Pull-forward mobility for :class:`WarpedGaussianMixturePotential`.
+
+    If ``J`` is the warp Jacobian, this class uses ``G = J J^T``.  It has
+    determinant one and the exact divergence ``(0, 2 * curvature)``.  With
+    the Itô correction, its Langevin diffusion is precisely the nonlinear
+    coordinate transform of Euclidean Langevin in latent space.
+    """
+
+    divergence_probe_cost = 0
+
+    def __init__(self, curvature: float) -> None:
+        super().__init__()
+        self.curvature = float(curvature)
+
+    def _shear(self, x: Tensor) -> Tensor:
+        if x.shape[-1] != 2:
+            raise ValueError("warp mobility is two-dimensional")
+        return 2.0 * self.curvature * x[:, 0]
+
+    def matrix(self, x: Tensor) -> Tensor:
+        shear = self._shear(x)
+        one = torch.ones_like(shear)
+        return torch.stack(
+            [one, shear, shear, one + shear.square()], dim=1
+        ).reshape(-1, 2, 2)
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        return torch.diagonal(self.matrix(x), dim1=1, dim2=2)
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return (self.matrix(x) @ vector.unsqueeze(-1)).squeeze(-1)
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        shear = self._shear(x)
+        inverse = torch.stack(
+            [1 + shear.square(), -shear, -shear, torch.ones_like(shear)], dim=1
+        ).reshape(-1, 2, 2)
+        return (inverse @ vector.unsqueeze(-1)).squeeze(-1)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        # The diffusion factor need not be the symmetric principal square
+        # root; J is cheaper and satisfies J J^T = G exactly.
+        shear = self._shear(x)
+        return torch.stack(
+            [noise[:, 0], shear * noise[:, 0] + noise[:, 1]], dim=1
+        )
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+
+    def log_eigenvalues(self, x: Tensor) -> Tensor:
+        return torch.linalg.eigvalsh(self.matrix(x)).clamp_min(1e-12).log()
+
+    def divergence(self, x: Tensor, *, n_samples=1, create_graph=False) -> Tensor:
+        del n_samples
+        result = torch.stack(
+            [torch.zeros_like(x[:, 0]), torch.full_like(x[:, 1], 2 * self.curvature)],
+            dim=1,
+        )
+        return result if create_graph else result.detach()
+
+
 class ScalarPotentialMLP(nn.Module):
     def __init__(self, dimension: int, hidden_dim: int = 128, depth: int = 3) -> None:
         super().__init__()
@@ -116,6 +254,149 @@ class FixedFullMobility(nn.Module):
     def logdet(self, x: Tensor) -> Tensor:
         value = torch.linalg.slogdet(self.fixed_matrix).logabsdet
         return value.expand(x.shape[0])
+
+    def divergence(self, x: Tensor, *, n_samples=1, create_graph=False) -> Tensor:
+        del n_samples, create_graph
+        return torch.zeros_like(x)
+
+
+class ConvexRidgeMirrorPotential(nn.Module):
+    """Strongly convex learned mirror potential with an analytic Hessian.
+
+    The potential is a positive weighted sum of softplus ridge functions plus
+    an isotropic quadratic term.  It is intentionally small and exact: in the
+    low-dimensional inductive-bias experiment, its inverse Hessian is the
+    mobility induced by a learned mirror map.  This is a controlled
+    frozen-energy adaptation, not an implementation of any paper's full
+    image-scale training pipeline.
+    """
+
+    def __init__(
+        self,
+        dimension: int,
+        width: int = 128,
+        *,
+        log_base_bound: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if dimension < 1 or width < 1 or log_base_bound <= 0:
+            raise ValueError("invalid mirror-potential configuration")
+        self.dimension = int(dimension)
+        self.width = int(width)
+        self.log_base_bound = float(log_base_bound)
+        self.directions = nn.Parameter(
+            torch.randn(width, dimension) / math.sqrt(dimension)
+        )
+        self.bias = nn.Parameter(torch.zeros(width))
+        # Near-zero positive ridge weights make the initial mirror close to
+        # the Euclidean quadratic while preserving strict convexity.
+        self.raw_weights = nn.Parameter(torch.full((width,), -5.0))
+        self.raw_log_base = nn.Parameter(torch.zeros(()))
+
+    def base_scale(self) -> Tensor:
+        return torch.exp(
+            self.log_base_bound * torch.tanh(self.raw_log_base)
+        )
+
+    def positive_weights(self) -> Tensor:
+        return torch.nn.functional.softplus(self.raw_weights) / self.width
+
+    def forward(self, x: Tensor) -> Tensor:
+        flat = x.reshape(x.shape[0], -1)
+        if flat.shape[1] != self.dimension:
+            raise ValueError("input dimension does not match mirror potential")
+        ridge = torch.nn.functional.softplus(
+            flat @ self.directions.transpose(0, 1) + self.bias
+        )
+        quadratic = 0.5 * self.base_scale() * flat.square().sum(dim=1)
+        return quadratic + ridge @ self.positive_weights()
+
+    def gradient(self, x: Tensor) -> Tensor:
+        flat = x.reshape(x.shape[0], -1)
+        logits = flat @ self.directions.transpose(0, 1) + self.bias
+        coefficients = torch.sigmoid(logits) * self.positive_weights()
+        result = self.base_scale() * flat + coefficients @ self.directions
+        return result.reshape_as(x)
+
+    def hessian(self, x: Tensor) -> Tensor:
+        flat = x.reshape(x.shape[0], -1)
+        logits = flat @ self.directions.transpose(0, 1) + self.bias
+        sigmoid = torch.sigmoid(logits)
+        curvature = sigmoid * (1.0 - sigmoid) * self.positive_weights()
+        identity = torch.eye(
+            self.dimension, device=x.device, dtype=x.dtype
+        ).unsqueeze(0)
+        ridge_hessian = torch.einsum(
+            "bk,ki,kj->bij", curvature, self.directions, self.directions
+        )
+        return self.base_scale() * identity + ridge_hessian
+
+
+class InverseHessianMobility(nn.Module):
+    """Mobility ``G=(nabla^2 Phi)^{-1}`` induced by a convex mirror map."""
+
+    def __init__(self, mirror_potential: ConvexRidgeMirrorPotential) -> None:
+        super().__init__()
+        self.mirror_potential = mirror_potential
+
+    def matrix(self, x: Tensor) -> Tensor:
+        return torch.linalg.inv(self.mirror_potential.hessian(x))
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        return torch.diagonal(self.matrix(x), dim1=-2, dim2=-1).reshape_as(x)
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        flat = vector.reshape(vector.shape[0], -1)
+        result = torch.linalg.solve(
+            self.mirror_potential.hessian(x), flat.unsqueeze(-1)
+        ).squeeze(-1)
+        return result.reshape_as(vector)
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        flat = vector.reshape(vector.shape[0], -1)
+        result = self.mirror_potential.hessian(x) @ flat.unsqueeze(-1)
+        return result.squeeze(-1).reshape_as(vector)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        root = torch.linalg.cholesky(self.matrix(x))
+        flat = noise.reshape(noise.shape[0], -1)
+        return (root @ flat.unsqueeze(-1)).squeeze(-1).reshape_as(noise)
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return -torch.linalg.slogdet(self.mirror_potential.hessian(x)).logabsdet
+
+    def log_eigenvalues(self, x: Tensor) -> Tensor:
+        return -torch.linalg.eigvalsh(
+            self.mirror_potential.hessian(x)
+        ).clamp_min(1e-12).log()
+
+    def divergence(self, x: Tensor, *, n_samples=1, create_graph=False) -> Tensor:
+        return hutchinson_divergence(
+            self, x, n_samples=n_samples, create_graph=create_graph
+        )
+
+
+class AdditiveResidualSampler(nn.Module):
+    """Adapter for an unrestricted additive residual drift.
+
+    ``apply(x, grad V)`` returns ``grad V - r(x)``, so the shared sampler uses
+    drift ``-grad V + r(x)`` and identity diffusion.  This is deliberately not
+    an SPD mobility and has no equilibrium correction; it exists to measure
+    the inductive-bias trade-off of a PEM-style residual field.
+    """
+
+    divergence_probe_cost = 0
+
+    def __init__(self, residual_field: nn.Module) -> None:
+        super().__init__()
+        self.residual_field = residual_field
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return vector - self.residual_field(x).reshape_as(vector)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        del x
+        return noise
 
     def divergence(self, x: Tensor, *, n_samples=1, create_graph=False) -> Tensor:
         del n_samples, create_graph

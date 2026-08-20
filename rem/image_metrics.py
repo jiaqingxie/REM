@@ -2,17 +2,130 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from pathlib import Path
+import os
+import tempfile
+from typing import Any, Mapping, Optional
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
 
-def to_uint8(images: Tensor) -> Tensor:
+FID_REAL_STAT_NAMES = (
+    "real_features_sum",
+    "real_features_cov_sum",
+    "real_features_num_samples",
+)
+
+
+def to_uint8(images: Tensor, *, quantization: str = "round") -> Tensor:
+    """Convert normalized images to uint8 using an explicit protocol.
+
+    ``round`` is the historical REM behavior. ``floor`` matches the official
+    Energy Matching evaluation, whose ``Tensor.byte()`` conversion truncates
+    values after rescaling to ``[0, 255]``.
+    """
+
     if images.dtype == torch.uint8:
         return images
-    return ((images.clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+    if quantization not in {"round", "floor"}:
+        raise ValueError("quantization must be 'round' or 'floor'")
+    scaled = (images.clamp(-1, 1) + 1) * 127.5
+    if quantization == "round":
+        scaled = scaled.round()
+    return scaled.to(torch.uint8)
+
+
+def export_fid_real_statistics(
+    fid: nn.Module,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a portable snapshot of TorchMetrics' accumulated real stats."""
+
+    missing = [name for name in FID_REAL_STAT_NAMES if not hasattr(fid, name)]
+    if missing:
+        raise RuntimeError(f"FID implementation lacks real-stat states: {missing}")
+    count = int(getattr(fid, "real_features_num_samples").item())
+    if count < 2:
+        raise ValueError("at least two real samples are required for FID statistics")
+    return {
+        "format": "rem_fid_real_statistics",
+        "format_version": 1,
+        "feature_dimension": int(getattr(fid, "real_features_sum").numel()),
+        "states": {
+            name: getattr(fid, name).detach().cpu().clone()
+            for name in FID_REAL_STAT_NAMES
+        },
+        "metadata": dict(metadata or {}),
+    }
+
+
+def import_fid_real_statistics(fid: nn.Module, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Restore cached real statistics into a compatible TorchMetrics FID."""
+
+    if payload.get("format") != "rem_fid_real_statistics":
+        raise ValueError("unrecognized FID real-statistics format")
+    if int(payload.get("format_version", -1)) != 1:
+        raise ValueError("unsupported FID real-statistics format version")
+    states = payload.get("states")
+    if not isinstance(states, Mapping):
+        raise ValueError("FID real-statistics payload has no states mapping")
+    feature_dimension = int(payload.get("feature_dimension", -1))
+    if feature_dimension != int(getattr(fid, "real_features_sum").numel()):
+        raise ValueError("cached FID feature dimension is incompatible")
+    for name in FID_REAL_STAT_NAMES:
+        if name not in states or not hasattr(fid, name):
+            raise ValueError(f"FID real-statistics payload is missing {name}")
+        source = states[name]
+        target = getattr(fid, name)
+        if not isinstance(source, Tensor) or source.shape != target.shape:
+            raise ValueError(
+                f"incompatible FID state {name}: expected {tuple(target.shape)}"
+            )
+        target.copy_(source.to(device=target.device, dtype=target.dtype))
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise ValueError("FID real-statistics metadata must be a mapping")
+    return dict(metadata)
+
+
+def save_fid_real_statistics(
+    path: str | Path,
+    fid: nn.Module,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """Atomically save accumulated real statistics without real features."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = export_fid_real_statistics(fid, metadata=metadata)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        torch.save(payload, temporary)
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def load_fid_real_statistics(path: str | Path, fid: nn.Module) -> dict[str, Any]:
+    """Load cached real statistics and return their provenance metadata."""
+
+    payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise ValueError("FID real-statistics file must contain a mapping")
+    return import_fid_real_statistics(fid, payload)
 
 
 class InceptionFeatures(nn.Module):
@@ -124,6 +237,8 @@ class ImageMetricSuite:
         device: torch.device | str,
         collect_precision_recall: bool = True,
         kid_subset_size: int = 1000,
+        compute_kid: bool = True,
+        quantization: str = "round",
     ) -> None:
         try:
             from torchmetrics.image.fid import FrechetInceptionDistance
@@ -131,10 +246,17 @@ class ImageMetricSuite:
         except ImportError as error:
             raise RuntimeError("FID/KID evaluation requires torchmetrics[image]") from error
         self.device = torch.device(device)
+        if quantization not in {"round", "floor"}:
+            raise ValueError("quantization must be 'round' or 'floor'")
+        self.quantization = quantization
         self.fid = FrechetInceptionDistance(normalize=False).to(self.device)
-        self.kid = KernelInceptionDistance(
-            subset_size=kid_subset_size, normalize=False
-        ).to(self.device)
+        self.kid = (
+            KernelInceptionDistance(
+                subset_size=kid_subset_size, normalize=False
+            ).to(self.device)
+            if compute_kid
+            else None
+        )
         self.feature_model: Optional[nn.Module] = (
             InceptionFeatures().to(self.device).eval()
             if collect_precision_recall
@@ -144,23 +266,50 @@ class ImageMetricSuite:
         self.fake_features: list[Tensor] = []
 
     @torch.no_grad()
-    def update(self, images: Tensor, *, real: bool) -> None:
+    def update(
+        self,
+        images: Tensor,
+        *,
+        real: bool,
+        update_fid: bool = True,
+        update_kid: bool = True,
+    ) -> None:
         images = images.to(self.device)
-        uint8 = to_uint8(images)
-        self.fid.update(uint8, real=real)
-        self.kid.update(uint8, real=real)
+        uint8 = to_uint8(images, quantization=self.quantization)
+        if update_fid:
+            self.fid.update(uint8, real=real)
+        if update_kid and self.kid is not None:
+            self.kid.update(uint8, real=real)
         if self.feature_model is not None:
             features = self.feature_model(images).cpu()
             (self.real_features if real else self.fake_features).append(features)
 
+    @property
+    def fid_real_samples(self) -> int:
+        return int(self.fid.real_features_num_samples.item())
+
+    def save_fid_real_statistics(
+        self,
+        path: str | Path,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        save_fid_real_statistics(path, self.fid, metadata=metadata)
+
+    def load_fid_real_statistics(self, path: str | Path) -> dict[str, Any]:
+        return load_fid_real_statistics(path, self.fid)
+
     @torch.no_grad()
     def compute(self) -> dict[str, float]:
-        kid_mean, kid_std = self.kid.compute()
-        metrics = {
-            "fid": float(self.fid.compute()),
-            "kid_mean": float(kid_mean),
-            "kid_std": float(kid_std),
-        }
+        metrics = {"fid": float(self.fid.compute())}
+        if self.kid is not None:
+            kid_mean, kid_std = self.kid.compute()
+            metrics.update(
+                {
+                    "kid_mean": float(kid_mean),
+                    "kid_std": float(kid_std),
+                }
+            )
         if self.feature_model is not None:
             real = torch.cat(self.real_features)
             fake = torch.cat(self.fake_features)

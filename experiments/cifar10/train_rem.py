@@ -46,6 +46,12 @@ from rem.training import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        choices=["cifar10", "imagenet32"],
+        default="cifar10",
+        help="32x32 image dataset used for frozen-energy mobility training",
+    )
     parser.add_argument("--mode", choices=["baseline", "frozen", "joint", "em-large"], default="frozen")
     parser.add_argument(
         "--mobility",
@@ -138,6 +144,30 @@ def distributed_context() -> tuple[bool, int, int, int, torch.device]:
     return distributed, rank, local_rank, world_size, device
 
 
+def configure_training_attention_backend(device: torch.device) -> None:
+    """Force a CUDA attention backend with parameter-gradient support.
+
+    The 25.06 image ships a PyTorch build where the efficient SDPA backward
+    kernel is not implemented for the Transformer blocks used by the official
+    CIFAR energy.  Math SDPA is slower but fully differentiable and is required
+    for reproducible REM training.
+    """
+
+    if device.type != "cuda":
+        return
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    if cuda_backends is None:
+        return
+    if hasattr(cuda_backends, "enable_flash_sdp"):
+        # Flash SDPA has a differentiable backward in the 25.06 image and is
+        # substantially faster than the math fallback for this ViT.
+        cuda_backends.enable_flash_sdp(True)
+    if hasattr(cuda_backends, "enable_mem_efficient_sdp"):
+        cuda_backends.enable_mem_efficient_sdp(False)
+    if hasattr(cuda_backends, "enable_math_sdp"):
+        cuda_backends.enable_math_sdp(True)
+
+
 def build_energy(args: argparse.Namespace) -> nn.Module:
     try:
         from experiments.cifar10.network_transformer_vit import EBViTModelWrapper
@@ -146,7 +176,10 @@ def build_energy(args: argparse.Namespace) -> nn.Module:
     multiplier = args.energy_width_multiplier
     if args.mode == "em-large" and multiplier <= 1:
         multiplier = 1.1
-    channels = max(16, int(round(args.num_channels * multiplier / 8)) * 8)
+    # torchcfm's upstream UNet uses GroupNorm(32, channels), so every
+    # resolution's base width must be divisible by 32.  Aligning only to 8
+    # makes EM-Large capacity searches fail for otherwise valid multipliers.
+    channels = max(32, int(round(args.num_channels * multiplier / 32)) * 32)
     embed_dim = max(
         args.transformer_heads,
         int(round(args.embed_dim * multiplier / args.transformer_heads))
@@ -182,12 +215,30 @@ def build_dataset(args, distributed: bool, rank: int):
     )
     if distributed and rank != 0:
         dist.barrier()
-    dataset = datasets.CIFAR10(
-        root=args.data_root,
-        train=True,
-        download=(not distributed or rank == 0),
-        transform=transform,
-    )
+    if args.dataset == "cifar10":
+        dataset = datasets.CIFAR10(
+            root=args.data_root,
+            train=True,
+            download=(not distributed or rank == 0),
+            transform=transform,
+        )
+    else:
+        from experiments.imagenet.dataset_imagenet32 import ImageNet32Dataset
+
+        dataset = ImageNet32Dataset(
+            split="train",
+            root=args.data_root,
+            transform=transforms.Compose(
+                [
+                    transforms.ToPILImage(),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+                    ),
+                ]
+            ),
+        )
     if distributed and rank == 0:
         dist.barrier()
     return dataset
@@ -221,6 +272,21 @@ def flow_loss(
     ).mean()
 
 
+def configure_energy_training_mode(energy: nn.Module, *, frozen: bool) -> None:
+    """Configure both gradients and stochastic-layer mode for the energy.
+
+    Freezing parameters alone does not disable Dropout.  Frozen REM must see
+    exactly the same deterministic official energy field during mobility
+    training that is used at evaluation time.
+    """
+
+    set_trainable(energy, not frozen)
+    if frozen:
+        energy.eval()
+    else:
+        energy.train()
+
+
 def main() -> None:
     args = parse_args()
     if args.max_training_seconds < 0:
@@ -232,13 +298,14 @@ def main() -> None:
             "joint mode requires --rem-init-checkpoint from the frozen stage or --resume"
         )
     distributed, rank, local_rank, world_size, device = distributed_context()
+    configure_training_attention_backend(device)
     if args.global_batch_size % world_size:
         raise ValueError("global batch size must be divisible by world size")
     local_batch = args.global_batch_size // world_size
     seed_everything(args.seed + rank)
 
     experiment_id = args.experiment_id or (
-        f"cifar10_{args.mode}_{args.mobility}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        f"{args.dataset}_{args.mode}_{args.mobility}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     artifacts = None
     if rank == 0:
@@ -247,6 +314,7 @@ def main() -> None:
             experiment_id,
             {**vars(args), "world_size": world_size, "local_batch_size": local_batch},
             repository_root=Path(__file__).resolve().parents[2],
+            resume_existing=bool(args.resume),
         )
 
     dataset = build_dataset(args, distributed, rank)
@@ -290,10 +358,7 @@ def main() -> None:
             mobility=mobility,
             strict=args.strict_checkpoint,
         )
-    if args.mode == "frozen":
-        set_trainable(energy, False)
-    else:
-        set_trainable(energy, True)
+    configure_energy_training_mode(energy, frozen=args.mode == "frozen")
     set_trainable(mobility, mobility_kind != "identity")
 
     anchor_energy = copy.deepcopy(energy).eval()
@@ -329,6 +394,12 @@ def main() -> None:
             ema_mobility=ema_mobility,
         )
         start_step = int(state["step"]) + 1
+        if args.mode == "frozen":
+            # Frozen REM promises to preserve the imported energy exactly.
+            # Older checkpoints updated an unchanged FP32 energy EMA every
+            # step, allowing rounding drift to accumulate. Repair that state
+            # on resume; the mobility EMA remains a genuine learned EMA.
+            ema_energy.load_state_dict(energy.state_dict())
 
     if distributed:
         composite_ddp: nn.Module = DDP(
@@ -356,6 +427,7 @@ def main() -> None:
                 "energy_parameters": trainable_parameter_count(energy),
                 "mobility_parameters": trainable_parameter_count(mobility),
                 "total_trainable_parameters": trainable_parameter_count(composite),
+                "energy_eval_mode": float(not energy.training),
             },
             split="setup",
             mode=args.mode,
@@ -441,7 +513,8 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
         optimizer.step()
         scheduler.step()
-        ema_update(energy, ema_energy, args.ema_decay)
+        if energy_parameters:
+            ema_update(energy, ema_energy, args.ema_decay)
         ema_update(mobility, ema_mobility, args.ema_decay)
 
         if step % args.log_every == 0 or step + 1 == args.total_steps:
@@ -494,7 +567,12 @@ def main() -> None:
                     now - training_start, maximum=True
                 ),
                 "examples_seen": (step + 1) * args.global_batch_size,
-                "lr_energy": optimizer.param_groups[0]["lr"],
+                "lr_energy": (
+                    optimizer.param_groups[0]["lr"] if energy_parameters else 0.0
+                ),
+                "lr_mobility": (
+                    optimizer.param_groups[-1]["lr"] if mobility_parameters else 0.0
+                ),
             }
             if rank == 0:
                 assert artifacts is not None

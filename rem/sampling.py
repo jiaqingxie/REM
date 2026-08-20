@@ -9,10 +9,15 @@ from typing import Callable, Optional
 import torch
 from torch import Tensor, nn
 
-from .geometry import riemannian_langevin_step
+from .geometry import (
+    IdentityMobility,
+    riemannian_langevin_heun_step,
+    riemannian_langevin_step,
+)
 
 
 TemperatureSchedule = Callable[[int, int, Tensor], float | Tensor]
+MobilitySchedule = Callable[[int, int, Tensor], nn.Module]
 
 
 @dataclass
@@ -60,6 +65,99 @@ def linear_temperature(
     return schedule
 
 
+def energy_matching_temperature(
+    epsilon_max: float,
+    *,
+    dt: float,
+    time_cutoff: float = 1.0,
+    ramp_end: float = 1.0,
+) -> TemperatureSchedule:
+    """Absolute-time noise schedule used by the official Energy Matching sampler.
+
+    The schedule is zero before ``time_cutoff``, ramps linearly to
+    ``epsilon_max`` by ``ramp_end``, and stays constant afterwards.  The
+    public CIFAR-10 configuration uses ``time_cutoff == ramp_end == 1``,
+    which gives the intended step from zero to ``epsilon_max`` at ``t=1``.
+
+    Unlike :func:`linear_temperature`, this schedule is invariant to the
+    number of integration steps when the physical terminal time is fixed.
+    That property is required for a valid FID-versus-NFE solver sweep.
+    """
+
+    if epsilon_max < 0 or dt <= 0:
+        raise ValueError("epsilon_max must be nonnegative and dt must be positive")
+    if time_cutoff < 0 or ramp_end < time_cutoff:
+        raise ValueError("temperature times must satisfy 0 <= cutoff <= ramp_end")
+
+    def schedule(step: int, total_steps: int, x: Tensor) -> float:
+        del total_steps, x
+        time_value = step * dt
+        if time_value < time_cutoff:
+            return 0.0
+        if ramp_end > time_cutoff and time_value < ramp_end:
+            fraction = (time_value - time_cutoff) / (ramp_end - time_cutoff)
+            return epsilon_max * fraction
+        return epsilon_max
+
+    return schedule
+
+
+def phase_gated_mobility(
+    mobility: nn.Module,
+    *,
+    dt: float,
+    active_until: float,
+) -> MobilitySchedule:
+    """Use learned mobility only on the physical-time interval it trained on.
+
+    REM's conditional-flow objective is trained with ``t`` in ``[0, 1]``.
+    The sampler can continue beyond that interval for Langevin refinement, but
+    those endpoints must use the original Energy Matching identity mobility.
+    At the boundary, Heun naturally evaluates the predictor with the learned
+    mobility and the corrector with identity mobility.
+    """
+
+    if dt <= 0 or active_until < 0:
+        raise ValueError("dt must be positive and active_until nonnegative")
+    identity = IdentityMobility()
+
+    def schedule(step: int, total_steps: int, x: Tensor) -> nn.Module:
+        del total_steps, x
+        return mobility if step * dt < active_until else identity
+
+    return schedule
+
+
+def _scheduled_mobility(
+    mobility: nn.Module,
+    schedule: Optional[MobilitySchedule],
+    step: int,
+    total_steps: int,
+    x: Tensor,
+) -> nn.Module:
+    return mobility if schedule is None else schedule(step, total_steps, x)
+
+
+def _temperature_at(
+    temperature: float | TemperatureSchedule,
+    step: int,
+    total_steps: int,
+    x: Tensor,
+) -> float | Tensor:
+    return temperature(step, total_steps, x) if callable(temperature) else temperature
+
+
+def _temperature_has_work(value: float | Tensor) -> bool:
+    if isinstance(value, Tensor):
+        return bool(torch.any(value != 0).item())
+    return float(value) != 0.0
+
+
+def _divergence_probe_cost(mobility: nn.Module, requested_probes: int) -> int:
+    value = getattr(mobility, "divergence_probe_cost", requested_probes)
+    return int(value(requested_probes) if callable(value) else value)
+
+
 def _potential(model: nn.Module, x: Tensor, t: Optional[Tensor]) -> Tensor:
     if hasattr(model, "potential"):
         if t is None:
@@ -78,9 +176,12 @@ def langevin_chain(
     temperature: float | TemperatureSchedule,
     include_divergence_correction: bool = True,
     divergence_samples: int = 1,
+    divergence_method: str = "hutchinson",
     clamp: Optional[tuple[float, float]] = None,
     save_every: int = 0,
     generator: Optional[torch.Generator] = None,
+    integrator: str = "euler",
+    mobility_schedule: Optional[MobilitySchedule] = None,
 ) -> tuple[Tensor, list[Tensor]]:
     """Run an equilibrium-correct REM chain.
 
@@ -90,16 +191,17 @@ def langevin_chain(
 
     if steps < 0 or dt <= 0 or divergence_samples < 1:
         raise ValueError("invalid sampler configuration")
+    if integrator not in {"euler", "heun"}:
+        raise ValueError("integrator must be 'euler' or 'heun'")
     x = x_init.detach()
     trajectory: list[Tensor] = []
     if save_every > 0:
         trajectory.append(x.cpu())
 
     for step in range(steps):
-        epsilon = (
-            temperature(step, steps, x)
-            if callable(temperature)
-            else temperature
+        epsilon = _temperature_at(temperature, step, steps, x)
+        current_mobility = _scheduled_mobility(
+            mobility, mobility_schedule, step, steps, x
         )
         t = torch.full(
             (x.shape[0],),
@@ -113,16 +215,47 @@ def langevin_chain(
             dtype=x.dtype,
             generator=generator,
         )
-        x = riemannian_langevin_step(
-            lambda value: _potential(energy, value, t),
-            mobility,
-            x,
-            dt=dt,
-            epsilon=epsilon,
-            include_divergence_correction=include_divergence_correction,
-            divergence_samples=divergence_samples,
-            noise=noise,
-        )
+        if integrator == "euler":
+            x = riemannian_langevin_step(
+                lambda value: _potential(energy, value, t),
+                current_mobility,
+                x,
+                dt=dt,
+                epsilon=epsilon,
+                include_divergence_correction=include_divergence_correction,
+                divergence_samples=divergence_samples,
+                divergence_method=divergence_method,
+                noise=noise,
+            )
+        else:
+            # Heun evaluates coefficients at both ends of the interval.  The
+            # final corrector therefore lives at ``step == steps`` rather than
+            # being clamped back onto the final predictor time.
+            next_step = step + 1
+            next_epsilon = _temperature_at(temperature, next_step, steps, x)
+            next_mobility = _scheduled_mobility(
+                mobility, mobility_schedule, next_step, steps, x
+            )
+            next_t = torch.full(
+                (x.shape[0],),
+                (step + 1) * dt,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            x = riemannian_langevin_heun_step(
+                lambda value: _potential(energy, value, t),
+                lambda value: _potential(energy, value, next_t),
+                current_mobility,
+                x,
+                dt=dt,
+                epsilon=epsilon,
+                next_epsilon=next_epsilon,
+                next_mobility=next_mobility,
+                include_divergence_correction=include_divergence_correction,
+                divergence_samples=divergence_samples,
+                divergence_method=divergence_method,
+                noise=noise,
+            )
         if clamp is not None:
             x = x.clamp(*clamp)
         if save_every > 0 and ((step + 1) % save_every == 0 or step + 1 == steps):
@@ -150,19 +283,40 @@ def profile_langevin_chain(
         peak_memory = 0
     elapsed = time.perf_counter() - start
     steps = int(kwargs["steps"])
-    probes = int(kwargs.get("divergence_samples", 1))
+    requested_probes = int(kwargs.get("divergence_samples", 1))
     corrected = bool(kwargs.get("include_divergence_correction", True))
-    probe_cost_value = getattr(mobility, "divergence_probe_cost", probes)
-    probe_cost = int(
-        probe_cost_value(probes) if callable(probe_cost_value) else probe_cost_value
-    )
+    evaluations_per_step = 2 if kwargs.get("integrator", "euler") == "heun" else 1
+    divergence_probes = 0
+    if corrected:
+        temperature = kwargs["temperature"]
+        mobility_schedule = kwargs.get("mobility_schedule")
+        for step in range(steps):
+            epsilon = _temperature_at(temperature, step, steps, x_init)
+            if _temperature_has_work(epsilon):
+                current_mobility = _scheduled_mobility(
+                    mobility, mobility_schedule, step, steps, x_init
+                )
+                divergence_probes += _divergence_probe_cost(
+                    current_mobility, requested_probes
+                )
+            if evaluations_per_step == 2:
+                next_epsilon = _temperature_at(
+                    temperature, step + 1, steps, x_init
+                )
+                if _temperature_has_work(next_epsilon):
+                    next_mobility = _scheduled_mobility(
+                        mobility, mobility_schedule, step + 1, steps, x_init
+                    )
+                    divergence_probes += _divergence_probe_cost(
+                        next_mobility, requested_probes
+                    )
     profile = SamplingProfile(
         steps=steps,
         batch_size=x_init.shape[0],
         wall_seconds=elapsed,
         samples_per_second=x_init.shape[0] / max(elapsed, 1e-12),
-        energy_grad_evaluations=steps,
-        divergence_probes=steps * probe_cost if corrected else 0,
+        energy_grad_evaluations=steps * evaluations_per_step,
+        divergence_probes=divergence_probes,
         peak_memory_bytes=peak_memory,
     )
     return final, trajectory, profile

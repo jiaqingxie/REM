@@ -41,9 +41,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def energy_count(args: argparse.Namespace, multiplier: float) -> int:
+def energy_count(
+    args: argparse.Namespace,
+    multiplier: float,
+    *,
+    enlarged: bool = True,
+) -> int:
     candidate = copy.copy(args)
-    candidate.mode = "em-large"
+    # Count the true baseline separately.  ``build_energy`` uses the
+    # ``em-large`` mode only to select the architecture; treating its default
+    # multiplier as an implicit 1.1 makes the width search non-monotone.
+    candidate.mode = "em-large" if enlarged and multiplier > 1.0 else "baseline"
     candidate.energy_width_multiplier = multiplier
     model = build_energy(candidate)
     count = trainable_parameter_count(model)
@@ -54,7 +62,7 @@ def energy_count(args: argparse.Namespace, multiplier: float) -> int:
 
 def main() -> None:
     args = parse_args()
-    base_energy = energy_count(args, 1.0)
+    base_energy = energy_count(args, 1.0, enlarged=False)
     mobility = build_mobility(
         args.mobility,
         (3, 32, 32),

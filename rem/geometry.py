@@ -382,6 +382,153 @@ class ConstantDiagonalMobility(nn.Module):
         return torch.zeros_like(x)
 
 
+class TemperedDiagonalMobility(nn.Module):
+    """Geodesically blend a diagonal mobility with the identity.
+
+    ``strength=0`` is exactly Euclidean, ``strength=1`` is the wrapped
+    mobility, and intermediate values scale its log-eigenvalues.  This is an
+    evaluation-time diagnostic for determining whether a learned geometry is
+    useful but over-applied along a long discretized trajectory.
+    """
+
+    def __init__(self, mobility: nn.Module, strength: float) -> None:
+        super().__init__()
+        if strength < 0:
+            raise ValueError("mobility strength must be nonnegative")
+        if not hasattr(mobility, "diagonal"):
+            raise TypeError("tempering requires a diagonal mobility interface")
+        self.mobility = mobility
+        self.strength = float(strength)
+
+    def divergence_probe_cost(self, requested_probes: int) -> int:
+        return 0 if self.strength == 0 else int(requested_probes)
+
+    def log_diagonal(self, x: Tensor) -> Tensor:
+        if self.strength == 0:
+            return torch.zeros_like(x)
+        diagonal = self.mobility.diagonal(x).clamp_min(1e-12)
+        return self.strength * diagonal.log()
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        return self.log_diagonal(x).exp()
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return self.diagonal(x) * vector
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return vector / self.diagonal(x)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        return (0.5 * self.log_diagonal(x)).exp() * noise
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return _flatten_batch(self.log_diagonal(x)).sum(dim=1)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        if self.strength == 0:
+            return torch.zeros_like(x)
+        return hutchinson_divergence(
+            self,
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+
+
+class TemperedFullMobility(nn.Module):
+    """Geodesically blend a full SPD mobility with the identity.
+
+    The wrapped mobility must expose its symmetric matrix logarithm. Scaling
+    that logarithm preserves eigenvectors, positive definiteness, and the
+    determinant-one gauge while retaining off-diagonal geometry.
+    """
+
+    def __init__(self, mobility: nn.Module, strength: float) -> None:
+        super().__init__()
+        if strength < 0:
+            raise ValueError("mobility strength must be nonnegative")
+        if not hasattr(mobility, "log_matrix"):
+            raise TypeError("full tempering requires a log_matrix interface")
+        self.mobility = mobility
+        self.strength = float(strength)
+
+    def divergence_probe_cost(self, requested_probes: int) -> int:
+        return 0 if self.strength == 0 else int(requested_probes)
+
+    def log_matrix(self, x: Tensor) -> Tensor:
+        if self.strength == 0:
+            dimension = _flatten_batch(x).shape[1]
+            return torch.zeros(
+                x.shape[0], dimension, dimension, device=x.device, dtype=x.dtype
+            )
+        return self.strength * self.mobility.log_matrix(x)
+
+    def matrix(self, x: Tensor) -> Tensor:
+        return torch.matrix_exp(self.log_matrix(x))
+
+    def log_eigenvalues(self, x: Tensor) -> Tensor:
+        return torch.linalg.eigvalsh(self.log_matrix(x))
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        diagonal = torch.diagonal(self.matrix(x), dim1=-2, dim2=-1)
+        return _restore_batch(diagonal, x)
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        result = self.matrix(x) @ _flatten_batch(vector).unsqueeze(-1)
+        return _restore_batch(result.squeeze(-1), vector)
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        matrix_inverse = torch.matrix_exp(-self.log_matrix(x))
+        result = matrix_inverse @ _flatten_batch(vector).unsqueeze(-1)
+        return _restore_batch(result.squeeze(-1), vector)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        matrix_sqrt = torch.matrix_exp(0.5 * self.log_matrix(x))
+        result = matrix_sqrt @ _flatten_batch(noise).unsqueeze(-1)
+        return _restore_batch(result.squeeze(-1), noise)
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return torch.diagonal(self.log_matrix(x), dim1=-2, dim2=-1).sum(dim=1)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        if self.strength == 0:
+            return torch.zeros_like(x)
+        return hutchinson_divergence(
+            self,
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+
+
+def temper_mobility(mobility: nn.Module, strength: float) -> nn.Module:
+    """Return the geometry-preserving identity interpolation for ``mobility``."""
+
+    if strength < 0:
+        raise ValueError("mobility strength must be nonnegative")
+    if strength == 0:
+        return IdentityMobility()
+    if strength == 1:
+        return mobility
+    if hasattr(mobility, "log_matrix"):
+        return TemperedFullMobility(mobility, strength)
+    if hasattr(mobility, "log_diagonal") or hasattr(mobility, "diagonal"):
+        return TemperedDiagonalMobility(mobility, strength)
+    raise TypeError("mobility does not expose a supported tempering interface")
+
+
 class GaugeFixedFullMobility(nn.Module):
     """Full SPD mobility for low-dimensional controlled experiments.
 
@@ -792,6 +939,67 @@ def hutchinson_divergence(
     return torch.stack(estimates, dim=0).mean(dim=0)
 
 
+def exact_mobility_divergence(
+    mobility: nn.Module,
+    x: Tensor,
+    *,
+    create_graph: bool = False,
+) -> Tensor:
+    """Compute ``div G`` exactly by summing coordinate JVPs.
+
+    This costs one JVP per state dimension, so it is intended for small
+    latent spaces such as the 16-dimensional AAV experiments. Known constant
+    mobilities can expose ``divergence_probe_cost = 0`` to skip the JVPs.
+    """
+
+    dimension = _flatten_batch(x).shape[1]
+    probe_cost = getattr(mobility, "divergence_probe_cost", None)
+    if probe_cost == 0:
+        return mobility.divergence(x, n_samples=1, create_graph=create_graph)
+
+    divergence = torch.zeros_like(x)
+    for coordinate in range(dimension):
+        basis = torch.zeros_like(x)
+        basis.reshape(x.shape[0], -1)[:, coordinate] = 1
+
+        def column_field(value: Tensor) -> Tensor:
+            return mobility.apply(value, basis)
+
+        _, directional_derivative = torch.autograd.functional.jvp(
+            column_field,
+            x,
+            basis,
+            create_graph=create_graph,
+            strict=False,
+        )
+        divergence = divergence + directional_derivative
+    return divergence
+
+
+def _mobility_divergence(
+    mobility: nn.Module,
+    x: Tensor,
+    *,
+    method: str,
+    n_samples: int,
+    create_graph: bool,
+) -> Tensor:
+    normalized = method.lower().replace("_", "-")
+    if normalized == "hutchinson":
+        return mobility.divergence(
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+    if normalized == "exact":
+        return exact_mobility_divergence(
+            mobility,
+            x,
+            create_graph=create_graph,
+        )
+    raise ValueError(f"unknown divergence method: {method}")
+
+
 def descent_condition_diagnostics(
     energy_gradient: Tensor,
     target_velocity: Tensor,
@@ -931,6 +1139,14 @@ def _as_batch_scalar(value: float | Tensor, reference: Tensor) -> Tensor:
     return tensor.reshape(tensor.shape[0], *([1] * (reference.ndim - 1)))
 
 
+def _temperature_is_nonzero(value: float | Tensor) -> bool:
+    """Return whether a scalar or per-sample temperature contains work."""
+
+    if isinstance(value, Tensor):
+        return bool(torch.any(value != 0).item())
+    return float(value) != 0.0
+
+
 def riemannian_langevin_step(
     potential_fn: PotentialFn,
     mobility: nn.Module,
@@ -940,6 +1156,7 @@ def riemannian_langevin_step(
     epsilon: float | Tensor,
     include_divergence_correction: bool = True,
     divergence_samples: int = 1,
+    divergence_method: str = "hutchinson",
     noise: Optional[Tensor] = None,
 ) -> Tensor:
     """Perform one Euler-Maruyama step of the equilibrium-correct REM SDE.
@@ -960,15 +1177,20 @@ def riemannian_langevin_step(
         drift = -mobility.apply(x_for_grad, gradient)
 
         epsilon_tensor = _as_batch_scalar(epsilon, x_for_grad)
-        if include_divergence_correction:
-            divergence = mobility.divergence(
+        has_temperature = _temperature_is_nonzero(epsilon)
+        if include_divergence_correction and has_temperature:
+            divergence = _mobility_divergence(
+                mobility,
                 x_for_grad,
+                method=divergence_method,
                 n_samples=divergence_samples,
                 create_graph=False,
             )
             drift = drift + epsilon_tensor * divergence
 
-        if hasattr(mobility, "sample_sqrt_noise"):
+        if not has_temperature:
+            diffusion = torch.zeros_like(x_for_grad)
+        elif hasattr(mobility, "sample_sqrt_noise"):
             diffusion = mobility.sample_sqrt_noise(x_for_grad, noise=noise)
         else:
             if noise is None:
@@ -979,6 +1201,88 @@ def riemannian_langevin_step(
         noise_scale = torch.sqrt(2.0 * epsilon_tensor * dt)
         updated = x_for_grad + dt * drift + noise_scale * diffusion
 
+    return updated.detach()
+
+
+def riemannian_langevin_heun_step(
+    potential_fn: PotentialFn,
+    next_potential_fn: PotentialFn,
+    mobility: nn.Module,
+    x: Tensor,
+    *,
+    dt: float,
+    epsilon: float | Tensor,
+    next_epsilon: float | Tensor,
+    next_mobility: Optional[nn.Module] = None,
+    include_divergence_correction: bool = True,
+    divergence_samples: int = 1,
+    divergence_method: str = "hutchinson",
+    noise: Optional[Tensor] = None,
+) -> Tensor:
+    """One stochastic Heun step for diagonal Riemannian mobility.
+
+    The equilibrium-correct Itô drift contains ``epsilon * div G``.  For a
+    diagonal diffusion square root, the equivalent Stratonovich drift used by
+    Heun contains ``0.5 * epsilon * div G``.  The same Brownian increment is
+    reused in the predictor and corrector.
+    """
+
+    if dt <= 0:
+        raise ValueError("dt must be positive")
+    if next_mobility is None:
+        next_mobility = mobility
+    if hasattr(mobility, "sample_sqrt_noise") or hasattr(
+        next_mobility, "sample_sqrt_noise"
+    ):
+        raise TypeError(
+            "stochastic Heun currently supports diagonal mobility square roots only"
+        )
+    if noise is None:
+        noise = torch.randn_like(x)
+    elif noise.shape != x.shape:
+        raise ValueError("noise must have the same shape as x")
+
+    def coefficients(
+        value: Tensor,
+        potential: PotentialFn,
+        temperature: float | Tensor,
+        local_mobility: nn.Module,
+    ) -> tuple[Tensor, Tensor]:
+        value_for_grad, gradient = _energy_gradient(
+            potential,
+            value.detach(),
+            create_graph=False,
+        )
+        temperature_tensor = _as_batch_scalar(temperature, value_for_grad)
+        has_temperature = _temperature_is_nonzero(temperature)
+        drift = -local_mobility.apply(value_for_grad, gradient)
+        if include_divergence_correction and has_temperature:
+            divergence = _mobility_divergence(
+                local_mobility,
+                value_for_grad,
+                method=divergence_method,
+                n_samples=divergence_samples,
+                create_graph=False,
+            )
+            drift = drift + 0.5 * temperature_tensor * divergence
+        if has_temperature:
+            diffusion = local_mobility.sqrt_apply(value_for_grad, noise)
+            increment = torch.sqrt(2.0 * temperature_tensor * dt) * diffusion
+        else:
+            increment = torch.zeros_like(value_for_grad)
+        return drift, increment
+
+    with torch.enable_grad():
+        drift, increment = coefficients(x, potential_fn, epsilon, mobility)
+        predictor = x.detach() + dt * drift + increment
+        next_drift, next_increment = coefficients(
+            predictor,
+            next_potential_fn,
+            next_epsilon,
+            next_mobility,
+        )
+        updated = x.detach() + 0.5 * dt * (drift + next_drift)
+        updated = updated + 0.5 * (increment + next_increment)
     return updated.detach()
 
 

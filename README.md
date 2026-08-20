@@ -10,36 +10,36 @@ Riemannian Energy Matching (REM) keeps a pretrained Energy Matching potential fi
 
 Given a frozen potential \(V_\theta\) and an OT-supervised velocity \(u_t\), REM learns \(G_\phi(x) \succ 0\) through
 
-```math
+$$
 u_t \approx -G_\phi(x_t)\nabla V_\theta(x_t),
 \qquad
 \det G_\phi(x_t)=1.
-```
+$$
 
 The learned mobility changes transport without changing the scalar energy. At positive temperature, the corrected diffusion is
 
-```math
+$$
 dX_s =
 \left[-G_\phi\nabla V_\theta
 +\varepsilon\,\mathrm{div}\,G_\phi\right]ds
 +\sqrt{2\varepsilon G_\phi}\,dW_s,
-```
+$$
 
 which preserves the original Lebesgue-density Boltzmann law
 
-```math
+$$
 \rho_\infty(x)\propto \exp[-V_\theta(x)/\varepsilon].
-```
+$$
 
 The repository supports two residual choices under the same mobility parameterization:
 
-```math
+$$
 \mathcal L_{\mathrm{REM}}(\phi;W)
 =\mathbb E\!\left[r_t^\top W_\phi(x_t)r_t\right]
 +\lambda_{\mathrm{geo}}\mathbb E\!\left[\|\log G_\phi(x_t)\|_F^2\right],
 \qquad
 r_t=u_t+G_\phi(x_t)\nabla V_\theta(x_t).
-```
+$$
 
 - `W = I` is the Euclidean residual used for controlled geometry recovery.
 - `W = G_phi^{-1}` is the intrinsic residual used in the image experiments.

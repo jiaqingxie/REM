@@ -21,7 +21,7 @@ The learned mobility changes transport without changing the scalar energy. At po
 ```math
 dX_s =
 \left[-G_\phi\nabla V_\theta
-+\varepsilon\,\operatorname{div}G_\phi\right]ds
++\varepsilon\,\mathrm{div}\,G_\phi\right]ds
 +\sqrt{2\varepsilon G_\phi}\,dW_s,
 ```
 

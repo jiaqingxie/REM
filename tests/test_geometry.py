@@ -9,6 +9,7 @@ from rem.geometry import (
     GaugeFixedDiagonalMobility,
     GaugeFixedFullMobility,
     IdentityMobility,
+    LowRankCongruenceMobility,
     TemperedFullMobility,
     UnfixedLogDiagonalMobility,
     construct_spd_mapping,
@@ -354,6 +355,26 @@ class GeometryTests(unittest.TestCase):
         torch.testing.assert_close(
             mobility.logdet(x), torch.zeros(3), atol=1e-5, rtol=0
         )
+
+    def test_structured_mobility_matches_dense_matrix_and_inverse(self):
+        network = nn.Linear(6, 6 * 3)
+        with torch.no_grad():
+            network.weight.normal_(std=0.03)
+            network.bias.zero_()
+        mobility = LowRankCongruenceMobility(network, dimension=6, rank=2)
+        x = torch.randn(4, 6)
+        vector = torch.randn_like(x)
+        dense = mobility.dense_matrix(x)
+        expected = torch.bmm(dense, vector.unsqueeze(-1)).squeeze(-1)
+        torch.testing.assert_close(
+            mobility.apply(x, vector), expected, atol=1e-5, rtol=1e-5
+        )
+        recovered = mobility.inverse_apply(x, expected)
+        torch.testing.assert_close(recovered, vector, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            mobility.logdet(x), torch.zeros(4), atol=1e-5, rtol=0
+        )
+        self.assertTrue(torch.all(torch.linalg.eigvalsh(dense) > 0))
 
     def test_minimal_distortion_is_zero_at_identity(self):
         x = torch.randn(4, 3)

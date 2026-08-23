@@ -8,6 +8,7 @@ from rem.geometry import (
     GaugeFixedDiagonalMobility,
     GaugeFixedFullMobility,
     IdentityMobility,
+    LowRankCongruenceMobility,
     UnfixedLogDiagonalMobility,
 )
 from rem.networks import REMModel, build_mobility
@@ -28,6 +29,7 @@ class NetworkTests(unittest.TestCase):
             "unfixed-diagonal": UnfixedLogDiagonalMobility,
             "full": GaugeFixedFullMobility,
             "low-rank": DiagonalPlusLowRankMobility,
+            "structured": LowRankCongruenceMobility,
         }
         for name, expected_type in expected_types.items():
             with self.subTest(name=name):
@@ -36,6 +38,19 @@ class NetworkTests(unittest.TestCase):
                 torch.testing.assert_close(
                     mobility.apply(x, vector), vector, atol=1e-6, rtol=1e-6
                 )
+
+    def test_structured_branch_has_gradient_at_identity(self):
+        mobility = build_mobility(
+            "structured", (8,), hidden_dim=12, depth=1, rank=2
+        )
+        x = torch.randn(5, 8)
+        vector = torch.randn_like(x)
+        target = torch.roll(vector, shifts=1, dims=1)
+        loss = (mobility.apply(x, vector) - target).square().mean()
+        loss.backward()
+        output = mobility.parameter_network.network[-1]
+        factor_gradient = output.bias.grad[8:]
+        self.assertGreater(float(factor_gradient.abs().sum()), 0.0)
 
     def test_image_diagonal_preserves_shape_and_gauge(self):
         x = torch.randn(2, 3, 8, 8)

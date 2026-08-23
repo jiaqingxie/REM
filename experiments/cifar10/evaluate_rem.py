@@ -189,7 +189,7 @@ def load_models(
     energy = build_energy(training_args)
     mobility_kind = (
         "identity"
-        if training_args.mode in {"baseline", "em-large"}
+        if training_args.mode in {"baseline", "continue-energy", "em-large"}
         else training_args.mobility
     )
     mobility = build_mobility(

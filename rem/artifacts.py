@@ -199,6 +199,11 @@ class RunArtifacts:
             json.dump(_jsonable(value), handle, indent=2, sort_keys=True)
             handle.write("\n")
 
+    def write_json(self, name: str, value: Any) -> None:
+        """Write an additional JSON artifact using the run serializer."""
+
+        self._write_json(name, value)
+
     def _append_jsonl(self, name: str, value: Any) -> None:
         with (self.path / name).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(_jsonable(value), sort_keys=True) + "\n")

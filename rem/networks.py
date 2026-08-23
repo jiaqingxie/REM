@@ -19,6 +19,7 @@ from .geometry import (
     GaugeFixedDiagonalMobility,
     GaugeFixedFullMobility,
     IdentityMobility,
+    LowRankCongruenceMobility,
     UnfixedLogDiagonalMobility,
     riemannian_velocity,
 )
@@ -227,6 +228,30 @@ def build_mobility(
             )
         return DiagonalPlusLowRankMobility(
             network,
+            rank,
+            log_bound=log_bound,
+        )
+    if normalized in {
+        "structured",
+        "structured-low-rank",
+        "rem-structured",
+    }:
+        if rank >= dimension:
+            raise ValueError("structured mobility rank must be below dimension")
+        if is_image:
+            network = ImageLowRankMobilityNetwork(
+                shape[0], hidden_dim, depth, rank=rank
+            )
+        else:
+            network = MLP(
+                dimension,
+                dimension * (rank + 1),
+                hidden_dim=hidden_dim,
+                depth=depth,
+            )
+        return LowRankCongruenceMobility(
+            network,
+            dimension,
             rank,
             log_bound=log_bound,
         )

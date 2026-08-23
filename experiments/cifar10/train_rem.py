@@ -52,7 +52,11 @@ def parse_args() -> argparse.Namespace:
         default="cifar10",
         help="32x32 image dataset used for frozen-energy mobility training",
     )
-    parser.add_argument("--mode", choices=["baseline", "frozen", "joint", "em-large"], default="frozen")
+    parser.add_argument(
+        "--mode",
+        choices=["baseline", "continue-energy", "frozen", "joint", "em-large"],
+        default="frozen",
+    )
     parser.add_argument(
         "--mobility",
         choices=[
@@ -62,6 +66,7 @@ def parse_args() -> argparse.Namespace:
             "diagonal",
             "unfixed-diagonal",
             "low-rank",
+            "structured",
         ],
         default="diagonal",
     )
@@ -293,6 +298,14 @@ def main() -> None:
         raise ValueError("max training seconds must be nonnegative")
     if args.mode == "frozen" and not args.energy_checkpoint and not args.resume:
         raise ValueError("frozen mode requires --energy-checkpoint or --resume")
+    if (
+        args.mode == "continue-energy"
+        and not args.energy_checkpoint
+        and not args.resume
+    ):
+        raise ValueError(
+            "continue-energy mode requires the same pretrained checkpoint as REM"
+        )
     if args.mode == "joint" and not args.rem_init_checkpoint and not args.resume:
         raise ValueError(
             "joint mode requires --rem-init-checkpoint from the frozen stage or --resume"
@@ -335,14 +348,23 @@ def main() -> None:
     batches = batch_stream(loader, sampler)
 
     energy = build_energy(args).to(device)
+    upstream_training_state = None
     if args.energy_checkpoint:
-        load_energy_state(
+        upstream_training_state = load_energy_state(
             energy,
             args.energy_checkpoint,
-            use_ema=args.use_ema_checkpoint,
+            # True continuation restores the raw trainable network together
+            # with its optimizer and scheduler; evaluation still uses EMA.
+            use_ema=(
+                args.use_ema_checkpoint and args.mode != "continue-energy"
+            ),
             strict=args.strict_checkpoint,
         )
-    mobility_kind = "identity" if args.mode in {"baseline", "em-large"} else args.mobility
+    mobility_kind = (
+        "identity"
+        if args.mode in {"baseline", "continue-energy", "em-large"}
+        else args.mobility
+    )
     mobility = build_mobility(
         mobility_kind,
         (3, 32, 32),
@@ -382,6 +404,30 @@ def main() -> None:
         return min(1.0, (step + 1) / max(args.warmup_steps, 1))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup)
+    source_energy_step = -1
+    if args.mode == "continue-energy" and not args.resume:
+        if not isinstance(upstream_training_state, dict):
+            raise ValueError("continued EM requires a full upstream training checkpoint")
+        missing = [
+            key
+            for key in ("optim", "sched", "ema_model", "step")
+            if key not in upstream_training_state
+        ]
+        if missing:
+            raise ValueError(
+                "continued EM checkpoint is missing training state: "
+                + ", ".join(missing)
+            )
+        ema_energy.load_state_dict(
+            upstream_training_state["ema_model"], strict=args.strict_checkpoint
+        )
+        optimizer.load_state_dict(upstream_training_state["optim"])
+        scheduler.load_state_dict(upstream_training_state["sched"])
+        for optimizer_state in optimizer.state.values():
+            for key, value in optimizer_state.items():
+                if isinstance(value, Tensor):
+                    optimizer_state[key] = value.to(device)
+        source_energy_step = int(upstream_training_state["step"])
     start_step = 0
     if args.resume:
         state = load_rem_checkpoint(
@@ -428,6 +474,7 @@ def main() -> None:
                 "mobility_parameters": trainable_parameter_count(mobility),
                 "total_trainable_parameters": trainable_parameter_count(composite),
                 "energy_eval_mode": float(not energy.training),
+                "source_energy_step": float(source_energy_step),
             },
             split="setup",
             mode=args.mode,
@@ -591,6 +638,7 @@ def main() -> None:
                 ema_mobility=ema_mobility,
                 step=step,
                 config={**vars(args), "world_size": world_size},
+                extra={"source_energy_step": source_energy_step},
             )
 
         if args.debug and step >= start_step + 2:
@@ -621,6 +669,7 @@ def main() -> None:
             ema_mobility=ema_mobility,
             step=last_step,
             config={**vars(args), "world_size": world_size},
+            extra={"source_energy_step": source_energy_step},
         )
         completed_steps = max(0, last_step - start_step + 1)
         artifacts.summarize(

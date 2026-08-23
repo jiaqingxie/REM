@@ -1,8 +1,8 @@
 # Riemannian Energy Matching
 
-**Learning transport geometry around a frozen energy model**
+**Fixed scalar density → supervised transport class → equilibrium-compatible lifting**
 
-Riemannian Energy Matching (REM) keeps a pretrained Energy Matching potential fixed and learns a bounded, determinant-one SPD mobility. The energy continues to define the modeled equilibrium, while the mobility changes how the sampler traverses that energy landscape.
+Riemannian Energy Matching (REM) keeps a pretrained Energy Matching potential fixed and learns a bounded, determinant-one SPD mobility from external OT velocity evidence. The object is not generic preconditioning: the scalar density is held fixed, supervision selects a representable transport field, and corrected dynamics lift that field back to the same equilibrium law.
 
 ![REM overview](media/rem_method_overview.png)
 
@@ -47,7 +47,7 @@ $$
 ## What is implemented
 
 - Pointwise SPD representability constructions and descent-margin diagnostics.
-- Identity, constant, scalar, determinant-one diagonal, full-SPD, and diagonal-plus-low-rank mobilities.
+- Identity, constant, scalar, determinant-one diagonal, full-SPD, diagonal-plus-low-rank, and first-order structured congruence mobilities.
 - Exact and Hutchinson divergence estimators for corrected Riemannian Langevin dynamics.
 - Controlled warped-mixture recovery, first-passage, and stationary-bias experiments.
 - Frozen-energy CIFAR-10 and ImageNet32 mobility training and official-protocol evaluation.
@@ -68,6 +68,8 @@ All image comparisons use the same frozen energy checkpoint and paired sampling 
 Across independent mobility fits, REM reduces held-out Euclidean OT velocity residual by 8.3% on CIFAR-10 and 11.2% on ImageNet32. The learned diagonal fields are also consistent across fits, with cross-fit correlations of 0.895 and 0.904, respectively.
 
 In the controlled nonlinear-warp diagnostic at curvature \(c=1.2\), full REM reaches relative velocity MSE \(0.00108\pm0.00025\) and first passage in \(111\pm14\) steps, compared with \(196\pm75\) steps for identity mobility. Removing the divergence correction produces persistent stationary bias under step-size refinement.
+
+With ordinary minibatch-OT chords in 64 dimensions, rank-four structured REM reaches held-out relative velocity MSE \(3.286\pm0.035\), versus \(11.055\pm0.143\) for a capacity-matched diagonal model, while preserving the exact target density. Continuing the exact scalar energy on the same evidence lowers the residual to \(0.924\pm0.005\) but changes equilibrium by \(18.301\pm0.067\) KL.
 
 ## Repository layout
 
@@ -116,6 +118,21 @@ python -m experiments.synthetic.run_geometry_stress \
 
 The controlled recovery phase directly supervises the analytic pushforward field, allowing the learned tensor to be compared with the known oracle mobility. The validity phase separately tests corrected and uncorrected state-dependent Langevin dynamics.
 
+## High-dimensional OT-chord lifting
+
+Run the non-oracle structured-mobility and energy-continuation comparison:
+
+```bash
+python -m experiments.synthetic.run_highdim_structured_ot \
+  --dimensions 64 \
+  --rank 4 \
+  --seeds 0,1,2,3,4 \
+  --train-steps 1200 \
+  --output outputs/highdim_structured_ot
+```
+
+The experiment uses independent minibatches, minibatch OT, and observed-space straight chords exactly as in image REM. `diagonal-matched` controls for network capacity; `continue-energy` starts from the exact target potential and reports its analytic equilibrium KL after fitting the same velocities.
+
 ## Frozen-energy image mobility
 
 Train a determinant-one diagonal mobility around an existing Energy Matching checkpoint:
@@ -129,6 +146,21 @@ python -m experiments.cifar10.train_rem \
   --seed 0 \
   --output outputs/cifar10_rem
 ```
+
+Continue the same Energy Matching checkpoint instead of freezing it:
+
+```bash
+python -m experiments.cifar10.train_rem \
+  --mode continue-energy \
+  --mobility identity \
+  --energy-checkpoint /path/to/full_energy_training_checkpoint.pt \
+  --data-root /path/to/cifar10 \
+  --total-steps 150000 \
+  --output outputs/cifar10_continue_energy
+```
+
+This mode restores the raw trainable energy together with its optimizer, scheduler, and EMA;
+evaluation uses the continued EMA checkpoint.
 
 Evaluate a trained checkpoint with the matched phase-gated sampler:
 
@@ -149,7 +181,7 @@ Use `--no-metric-weighted` during training for the Euclidean-residual ablation. 
 
 ## Scope
 
-The full-SPD construction and corrected state-dependent stochastic sampler are evaluated in the controlled low-dimensional setting. Image experiments use scalable determinant-one diagonal mobility during the deterministic transport phase and identity mobility during positive-temperature refinement.
+The full-SPD corrected stochastic sampler is evaluated in the controlled low-dimensional setting. Structured off-diagonal mobility is tested with non-oracle OT supervision in 64 dimensions. Image experiments currently use determinant-one diagonal mobility during deterministic transport and identity mobility during positive-temperature refinement.
 
 ## Upstream attribution
 

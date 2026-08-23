@@ -633,6 +633,228 @@ class GaugeFixedFullMobility(nn.Module):
         )
 
 
+def orthonormal_cosine_basis(
+    dimension: int,
+    rank: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Return deterministic dense orthonormal directions in ``R^dimension``.
+
+    The nonconstant DCT-II modes avoid privileging individual coordinates and
+    make structured-mobility runs reproducible without storing a random basis.
+    """
+
+    if dimension < 2 or rank < 1 or rank >= dimension:
+        raise ValueError("require dimension >= 2 and 1 <= rank < dimension")
+    coordinates = torch.arange(dimension, dtype=dtype).add_(0.5).unsqueeze(1)
+    frequencies = torch.arange(1, rank + 1, dtype=dtype).unsqueeze(0)
+    return (2.0 / dimension) ** 0.5 * torch.cos(
+        math.pi * coordinates * frequencies / dimension
+    )
+
+
+class LowRankCongruenceMobility(nn.Module):
+    """Scalable determinant-one structured mobility with first-order mixing.
+
+    Let ``D`` be a learned determinant-one diagonal matrix, ``B`` a fixed
+    orthonormal ``d x r`` basis, and ``C(x)`` a learned ``d x r`` correction.
+    This class represents
+
+        G(x) = s(x) D(x)^{1/2} Q(x) Q(x)^T D(x)^{1/2},
+        Q(x) = I + B C(x)^T,
+
+    where the scalar ``s`` enforces ``det G = 1`` exactly.  Unlike the common
+    ``D + U U^T`` parameterization, ``G`` has a nonzero first derivative with
+    respect to ``C`` at ``C=0``.  A zero-output network therefore starts at
+    identity while the off-diagonal branch can learn immediately.
+
+    All drift, inverse, log-determinant, and noise-factor operations cost
+    ``O(d r + r^3)`` and never materialize a dense ``d x d`` image matrix.
+    """
+
+    def __init__(
+        self,
+        parameter_network: nn.Module,
+        dimension: int,
+        rank: int,
+        *,
+        log_bound: float = 1.5,
+        correction_scale: float = 0.75,
+    ) -> None:
+        super().__init__()
+        if dimension < 2 or rank < 1 or rank >= dimension:
+            raise ValueError("require dimension >= 2 and 1 <= rank < dimension")
+        if log_bound <= 0 or not 0 < correction_scale < 1:
+            raise ValueError("log_bound must be positive and correction_scale in (0,1)")
+        self.parameter_network = parameter_network
+        self.dimension = int(dimension)
+        self.rank = int(rank)
+        self.log_bound = float(log_bound)
+        self.correction_scale = float(correction_scale)
+        self.register_buffer(
+            "basis",
+            orthonormal_cosine_basis(self.dimension, self.rank),
+            persistent=True,
+        )
+
+    def _raw_components(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        if _flatten_batch(x).shape[1] != self.dimension:
+            raise ValueError("input event dimension does not match structured mobility")
+        output = self.parameter_network(x)
+        if isinstance(output, tuple):
+            diagonal_logits, corrections = output
+            diagonal_logits = _flatten_batch(diagonal_logits)
+            if corrections.shape != (x.shape[0], self.dimension, self.rank):
+                raise ValueError("structured corrections must have shape (B,d,rank)")
+        else:
+            expected = self.dimension * (self.rank + 1)
+            if output.shape != (x.shape[0], expected):
+                raise ValueError(
+                    f"parameter network must return (B,{expected}) for this input"
+                )
+            diagonal_logits = output[:, : self.dimension]
+            corrections = output[:, self.dimension :].reshape(
+                x.shape[0], self.dimension, self.rank
+            )
+        return diagonal_logits, corrections
+
+    def components(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        diagonal_logits, raw_corrections = self._raw_components(x)
+        bounded = self.log_bound * torch.tanh(diagonal_logits)
+        diagonal_logs = bounded - bounded.mean(dim=1, keepdim=True)
+        half_diagonal = torch.exp(0.5 * diagonal_logs)
+        corrections = (
+            self.correction_scale
+            * torch.tanh(raw_corrections)
+            / math.sqrt(self.dimension * self.rank)
+        )
+        basis = self.basis.to(device=x.device, dtype=x.dtype)
+        small = torch.eye(
+            self.rank, device=x.device, dtype=x.dtype
+        ).unsqueeze(0) + corrections.transpose(1, 2) @ basis
+        sign, logabsdet = torch.linalg.slogdet(small)
+        if bool(torch.any(sign <= 0).item()):
+            raise RuntimeError("structured mobility lost orientation")
+        log_scale = -(
+            diagonal_logs.sum(dim=1) + 2.0 * logabsdet
+        ) / self.dimension
+        return half_diagonal, corrections, small, log_scale
+
+    def _q_apply(self, vector: Tensor, corrections: Tensor, basis: Tensor) -> Tensor:
+        return vector + torch.einsum(
+            "dr,br->bd",
+            basis,
+            torch.einsum("bdr,bd->br", corrections, vector),
+        )
+
+    def _qt_apply(self, vector: Tensor, corrections: Tensor, basis: Tensor) -> Tensor:
+        return vector + torch.einsum(
+            "bdr,br->bd",
+            corrections,
+            torch.einsum("dr,bd->br", basis, vector),
+        )
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        half, corrections, _, log_scale = self.components(x)
+        basis = self.basis.to(device=x.device, dtype=x.dtype)
+        middle = half * _flatten_batch(vector)
+        middle = self._qt_apply(middle, corrections, basis)
+        middle = self._q_apply(middle, corrections, basis)
+        result = log_scale.exp().unsqueeze(1) * half * middle
+        return _restore_batch(result, vector)
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        half, corrections, small, log_scale = self.components(x)
+        basis = self.basis.to(device=x.device, dtype=x.dtype)
+        middle = _flatten_batch(vector) / half
+        # Q^{-1} y = y - B (I + C^T B)^{-1} C^T y.
+        coefficient = torch.linalg.solve(
+            small,
+            torch.einsum("bdr,bd->br", corrections, middle).unsqueeze(-1),
+        ).squeeze(-1)
+        middle = middle - torch.einsum("dr,br->bd", basis, coefficient)
+        # Q^{-T} y = y - C (I + B^T C)^{-1} B^T y.
+        coefficient = torch.linalg.solve(
+            small.transpose(1, 2),
+            torch.einsum("dr,bd->br", basis, middle).unsqueeze(-1),
+        ).squeeze(-1)
+        middle = middle - torch.einsum("bdr,br->bd", corrections, coefficient)
+        result = torch.exp(-log_scale).unsqueeze(1) * middle / half
+        return _restore_batch(result, vector)
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        half, corrections, _, log_scale = self.components(x)
+        basis = self.basis.to(device=x.device, dtype=x.dtype)
+        cross = 2.0 * torch.einsum("dr,bdr->bd", basis, corrections)
+        correction_gram = corrections.transpose(1, 2) @ corrections
+        quadratic = torch.einsum("dr,brs,ds->bd", basis, correction_gram, basis)
+        q_diagonal = 1.0 + cross + quadratic
+        result = log_scale.exp().unsqueeze(1) * half.square() * q_diagonal
+        return _restore_batch(result, x)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        half, corrections, _, log_scale = self.components(x)
+        basis = self.basis.to(device=x.device, dtype=x.dtype)
+        transformed = self._q_apply(_flatten_batch(noise), corrections, basis)
+        result = torch.exp(0.5 * log_scale).unsqueeze(1) * half * transformed
+        return _restore_batch(result, noise)
+
+    def sample_sqrt_noise(
+        self,
+        x: Tensor,
+        *,
+        noise: Optional[Tensor] = None,
+        rank_noise: Optional[Tensor] = None,
+    ) -> Tensor:
+        del rank_noise
+        if noise is None:
+            noise = torch.randn_like(x)
+        return self.sqrt_apply(x, noise)
+
+    def logdet(self, x: Tensor) -> Tensor:
+        half, _, small, log_scale = self.components(x)
+        _, logabsdet = torch.linalg.slogdet(small)
+        return (
+            self.dimension * log_scale
+            + 2.0 * half.log().sum(dim=1)
+            + 2.0 * logabsdet
+        )
+
+    def distortion_regularizer(self, x: Tensor) -> Tensor:
+        half, corrections, _, log_scale = self.components(x)
+        centered_logs = 2.0 * half.log() + log_scale.unsqueeze(1)
+        return centered_logs.square().mean() + 2.0 * corrections.square().sum(
+            dim=(1, 2)
+        ).mean() / self.dimension
+
+    def dense_matrix(self, x: Tensor) -> Tensor:
+        """Materialize ``G`` for diagnostics in moderate dimensions."""
+
+        half, corrections, _, log_scale = self.components(x)
+        basis = self.basis.to(device=x.device, dtype=x.dtype)
+        identity = torch.eye(
+            self.dimension, device=x.device, dtype=x.dtype
+        ).expand(x.shape[0], -1, -1)
+        q = identity + basis.unsqueeze(0) @ corrections.transpose(1, 2)
+        factor = half.unsqueeze(2) * q
+        return log_scale.exp().view(-1, 1, 1) * factor @ factor.transpose(1, 2)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        return hutchinson_divergence(
+            self,
+            x,
+            n_samples=n_samples,
+            create_graph=create_graph,
+        )
+
+
 class DiagonalPlusLowRankMobility(nn.Module):
     """Scalable determinant-one mobility ``G = D + U U^T``.
 

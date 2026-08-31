@@ -13,6 +13,7 @@ import torch
 from torch import Tensor, nn
 
 from .geometry import (
+    AdditiveResidualTransport,
     BoundedScalarMobility,
     ConstantDiagonalMobility,
     DiagonalPlusLowRankMobility,
@@ -165,6 +166,23 @@ def build_mobility(
 
     if normalized in {"identity", "em"}:
         return IdentityMobility()
+    if normalized in {"additive-residual", "residual", "free-residual"}:
+        if len(shape) == 3:
+            network = ImageDiagonalMobilityNetwork(shape[0], hidden_dim, depth)
+        else:
+            base = MLP(dimension, dimension, hidden_dim=hidden_dim, depth=depth)
+
+            class ReshapeResidualNetwork(nn.Module):
+                def __init__(self, wrapped: nn.Module, output_shape: tuple[int, ...]) -> None:
+                    super().__init__()
+                    self.wrapped = wrapped
+                    self.output_shape = output_shape
+
+                def forward(self, x: Tensor) -> Tensor:
+                    return self.wrapped(x).reshape(x.shape[0], *self.output_shape)
+
+            network = ReshapeResidualNetwork(base, shape)
+        return AdditiveResidualTransport(network)
     if normalized in {"constant", "em-const"}:
         return ConstantDiagonalMobility(dimension, log_bound=log_bound)
 

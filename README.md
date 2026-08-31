@@ -2,7 +2,7 @@
 
 **Fixed scalar density → supervised transport class → equilibrium-compatible lifting**
 
-Riemannian Energy Matching (REM) keeps a pretrained Energy Matching potential fixed and learns a bounded, determinant-one SPD mobility from external OT velocity evidence. The object is not generic preconditioning: the scalar density is held fixed, supervision selects a representable transport field, and corrected dynamics lift that field back to the same equilibrium law.
+Riemannian Energy Matching (REM) keeps a pretrained Energy Matching potential fixed and learns a bounded, determinant-one SPD mobility from external OT velocity evidence. It is a preconditioner---but a supervised and gauge-fixed one paired with a corrected sampler: the scalar density is held fixed, supervision selects a representable transport field, and corrected dynamics preserve the same equilibrium law.
 
 ![REM overview](media/rem_method_overview.png)
 
@@ -53,6 +53,8 @@ $$
 - Frozen-energy CIFAR-10 and ImageNet32 mobility training and official-protocol evaluation.
 - Independent mobility-training and sampling-seed aggregation.
 - PEM-inspired residual and learned-mirror representation controls.
+- A parameter-matched additive-residual control that separates geometric inductive bias from generic extra transport capacity.
+- Non-oracle curved 16D and correlated-Gaussian 16D/64D corrected-sampling diagnostics, including an oracle global-covariance calibration.
 - Image mobility diagnostics, including held-out OT residuals, descent margins, log-eigenvalue statistics, and cross-fit consistency.
 - Inverse-problem and protein experiment entry points.
 
@@ -70,6 +72,8 @@ Across independent mobility fits, REM reduces held-out Euclidean OT velocity res
 In the controlled nonlinear-warp diagnostic at curvature \(c=1.2\), full REM reaches relative velocity MSE \(0.00108\pm0.00025\) and first passage in \(111\pm14\) steps, compared with \(196\pm75\) steps for identity mobility. Removing the divergence correction produces persistent stationary bias under step-size refinement.
 
 With ordinary minibatch-OT chords in 64 dimensions, rank-four structured REM reaches held-out relative velocity MSE \(3.286\pm0.035\), versus \(11.055\pm0.143\) for a capacity-matched diagonal model, while preserving the exact target density. Continuing the exact scalar energy on the same evidence lowers the residual to \(0.924\pm0.005\) but changes equilibrium by \(18.301\pm0.067\) KL.
+
+On CIFAR-10, a parameter-matched, phase-gated additive residual trained with the same OT chords reaches 3.686 FID, compared with 3.462 for frozen EM and 3.297 for REM. This control tests whether the gain comes merely from adding another state-dependent transport network.
 
 ## Repository layout
 
@@ -132,6 +136,21 @@ python -m experiments.synthetic.run_highdim_structured_ot \
 ```
 
 The experiment uses independent minibatches, minibatch OT, and observed-space straight chords exactly as in image REM. `diagonal-matched` controls for network capacity; `continue-energy` starts from the exact target potential and reports its analytic equilibrium KL after fitting the same velocities.
+
+Run the non-oracle curved target and corrected positive-temperature diagnostics:
+
+```bash
+python -m experiments.synthetic.run_nonoracle_curved_ot \
+  --dimension 16 --rank 4 --seeds 0,1,2,3,4 \
+  --output outputs/nonoracle_curved_ot
+
+python -m experiments.synthetic.run_highdim_corrected_sampling \
+  --dimensions 16,64 --rank 4 --seeds 0,1,2,3,4 \
+  --variants identity,global-covariance,diagonal,structured,structured-no-div \
+  --output outputs/highdim_corrected_sampling
+```
+
+The global-covariance row uses the known Gaussian covariance and is therefore an oracle-style classical calibration, not a learned baseline.
 
 ## Frozen-energy image mobility
 

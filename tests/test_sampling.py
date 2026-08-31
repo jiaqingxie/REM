@@ -3,7 +3,7 @@ import unittest
 import torch
 from torch import nn
 
-from rem.geometry import IdentityMobility
+from rem.geometry import AdditiveResidualTransport, IdentityMobility
 from rem.sampling import (
     constant_temperature,
     energy_matching_temperature,
@@ -41,7 +41,54 @@ class ConstantScaleMobility(nn.Module):
         return torch.zeros_like(x)
 
 
+class FullSquareRootMobility(ConstantScaleMobility):
+    """Marker for a mobility whose stochastic square root is non-diagonal."""
+
+    def sample_sqrt_noise(self, x, *, noise=None, generator=None):
+        del generator
+        if noise is None:
+            noise = torch.randn_like(x)
+        return self.scale**0.5 * noise
+
+
 class SamplingTests(unittest.TestCase):
+    def test_additive_residual_transport_matches_requested_drift(self):
+        class ConstantResidual(nn.Module):
+            def forward(self, x):
+                return torch.full_like(x, 0.5)
+
+        transport = AdditiveResidualTransport(ConstantResidual())
+        initial = torch.ones(1, 1)
+        final, _ = langevin_chain(
+            QuadraticEnergy(),
+            transport,
+            initial,
+            steps=1,
+            dt=0.1,
+            temperature=0.0,
+        )
+        # -grad V + r = -1 + 0.5 at x=1.
+        torch.testing.assert_close(final, torch.full_like(initial, 0.95))
+
+    def test_phase_gate_turns_additive_residual_off_before_noise(self):
+        class ConstantResidual(nn.Module):
+            def forward(self, x):
+                return torch.full_like(x, 0.5)
+
+        transport = AdditiveResidualTransport(ConstantResidual())
+        schedule = phase_gated_mobility(transport, dt=0.1, active_until=0.1)
+        final, _ = langevin_chain(
+            QuadraticEnergy(),
+            transport,
+            torch.ones(1, 1),
+            steps=2,
+            dt=0.1,
+            temperature=0.0,
+            mobility_schedule=schedule,
+        )
+        # First step uses -x + .5; second step uses the identity drift -x.
+        torch.testing.assert_close(final, torch.full((1, 1), 0.855))
+
     def test_zero_temperature_chain_is_deterministic(self):
         initial = torch.tensor([[1.0, -2.0]])
         final, trajectory = langevin_chain(
@@ -142,6 +189,40 @@ class SamplingTests(unittest.TestCase):
             mobility_schedule=schedule,
         )
         self.assertEqual(profile.divergence_probes, 0)
+
+    def test_phase_gated_heun_allows_full_mobility_only_at_zero_temperature(self):
+        mobility = FullSquareRootMobility(2.0)
+        initial = torch.ones(1, 1)
+        schedule = phase_gated_mobility(mobility, dt=0.1, active_until=0.1)
+        temperature = energy_matching_temperature(
+            0.1, dt=0.1, time_cutoff=0.1, ramp_end=0.1
+        )
+
+        final, _ = langevin_chain(
+            QuadraticEnergy(),
+            mobility,
+            initial,
+            steps=2,
+            dt=0.1,
+            temperature=temperature,
+            integrator="heun",
+            mobility_schedule=schedule,
+            generator=torch.Generator().manual_seed(0),
+        )
+
+        self.assertEqual(final.shape, initial.shape)
+
+    def test_heun_rejects_full_mobility_at_positive_temperature(self):
+        with self.assertRaisesRegex(TypeError, "diagonal mobility square roots"):
+            langevin_chain(
+                QuadraticEnergy(),
+                FullSquareRootMobility(2.0),
+                torch.ones(1, 1),
+                steps=1,
+                dt=0.1,
+                temperature=0.1,
+                integrator="heun",
+            )
 
     def test_temperature_schedules(self):
         x = torch.zeros(1, 1)

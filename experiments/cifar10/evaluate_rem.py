@@ -225,6 +225,7 @@ def load_models(
             "scalar",
             "diagonal",
             "unfixed-diagonal",
+            "additive-residual",
         }:
             raise ValueError("--mobility-strength supports diagonal mobilities only")
         mobility = TemperedDiagonalMobility(mobility, mobility_strength)

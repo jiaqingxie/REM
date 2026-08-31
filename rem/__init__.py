@@ -1,6 +1,7 @@
 """Core geometry primitives for Riemannian Energy Matching."""
 
 from .geometry import (
+    AdditiveResidualTransport,
     BoundedScalarMobility,
     ConstantDiagonalMobility,
     DiagonalPlusLowRankMobility,
@@ -22,6 +23,7 @@ from .geometry import (
 from .networks import REMModel, build_mobility
 
 __all__ = [
+    "AdditiveResidualTransport",
     "BoundedScalarMobility",
     "ConstantDiagonalMobility",
     "DiagonalPlusLowRankMobility",

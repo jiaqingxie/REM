@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
             "unfixed-diagonal",
             "low-rank",
             "structured",
+            "additive-residual",
         ],
         default="diagonal",
     )
@@ -511,7 +512,10 @@ def main() -> None:
             target_velocity,
             mobility,
             x_t,
-            metric_weighted=args.metric_weighted and mobility_kind != "identity",
+            metric_weighted=(
+                args.metric_weighted
+                and mobility_kind not in {"identity", "additive-residual"}
+            ),
         )
         geometry = minimal_distortion_regularizer(mobility, x_t)
         contrastive = transport.new_zeros(())

@@ -70,6 +70,65 @@ class IdentityMobility(nn.Module):
         return torch.zeros_like(x)
 
 
+class AdditiveResidualTransport(nn.Module):
+    """Capacity-matched non-geometric transport control.
+
+    The sampler forms its deterministic drift as ``-apply(x, grad V)``.  This
+    adapter therefore returns ``grad V - r_psi(x)``, giving the additive field
+    ``-grad V + r_psi(x)`` while retaining identity diffusion.  It is
+    deliberately *not* an SPD mobility and has no same-energy equilibrium
+    guarantee if left active at positive temperature; image experiments gate
+    it off before the Langevin refinement phase.
+    """
+
+    divergence_probe_cost = 0
+
+    def __init__(self, residual_network: nn.Module) -> None:
+        super().__init__()
+        self.residual_network = residual_network
+
+    def residual(self, x: Tensor) -> Tensor:
+        value = self.residual_network(x)
+        if value.shape != x.shape:
+            raise ValueError(
+                "residual_network must preserve the input shape; "
+                f"received input {tuple(x.shape)} and output {tuple(value.shape)}"
+            )
+        return value
+
+    def apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        return vector - self.residual(x)
+
+    def sqrt_apply(self, x: Tensor, noise: Tensor) -> Tensor:
+        del x
+        return noise
+
+    def inverse_apply(self, x: Tensor, vector: Tensor) -> Tensor:
+        # This method exists only so the shared training/evaluation plumbing can
+        # score the control in Euclidean norm.  It is not a metric inverse.
+        del x
+        return vector
+
+    def diagonal(self, x: Tensor) -> Tensor:
+        return torch.ones_like(x)
+
+    def log_diagonal(self, x: Tensor) -> Tensor:
+        return torch.zeros_like(x)
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+
+    def divergence(
+        self,
+        x: Tensor,
+        *,
+        n_samples: int = 1,
+        create_graph: bool = False,
+    ) -> Tensor:
+        del n_samples, create_graph
+        return torch.zeros_like(x)
+
+
 class DiagonalMobility(nn.Module):
     """Bounded state-dependent diagonal mobility.
 
@@ -1453,9 +1512,13 @@ def riemannian_langevin_heun_step(
         raise ValueError("dt must be positive")
     if next_mobility is None:
         next_mobility = mobility
-    if hasattr(mobility, "sample_sqrt_noise") or hasattr(
+    current_requires_full_sqrt = _temperature_is_nonzero(epsilon) and hasattr(
+        mobility, "sample_sqrt_noise"
+    )
+    next_requires_full_sqrt = _temperature_is_nonzero(next_epsilon) and hasattr(
         next_mobility, "sample_sqrt_noise"
-    ):
+    )
+    if current_requires_full_sqrt or next_requires_full_sqrt:
         raise TypeError(
             "stochastic Heun currently supports diagonal mobility square roots only"
         )

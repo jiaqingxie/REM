@@ -96,6 +96,9 @@ tests/               unit and smoke tests
 
 The codebase targets Python 3.10 and PyTorch with CUDA.
 
+Dataset acquisition, checkpoint hashes, preprocessing, FID-stat caching, and the nested seed
+protocol are documented in [data.md](data.md).
+
 ```bash
 conda create -n rem python=3.10 -y
 conda activate rem

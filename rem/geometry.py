@@ -508,6 +508,8 @@ class TemperedFullMobility(nn.Module):
     determinant-one gauge while retaining off-diagonal geometry.
     """
 
+    stochastic_heun_compatible = False
+
     def __init__(self, mobility: nn.Module, strength: float) -> None:
         super().__init__()
         if strength < 0:
@@ -596,6 +598,8 @@ class GaugeFixedFullMobility(nn.Module):
     made traceless, and exponentiated. Consequently the mobility is SPD and
     has determinant one by construction.
     """
+
+    stochastic_heun_compatible = False
 
     def __init__(
         self,
@@ -729,8 +733,11 @@ class LowRankCongruenceMobility(nn.Module):
     identity while the off-diagonal branch can learn immediately.
 
     All drift, inverse, log-determinant, and noise-factor operations cost
-    ``O(d r + r^3)`` and never materialize a dense ``d x d`` image matrix.
+    ``O(d r^2 + r^3)``, including small-matrix construction, and never
+    materialize a dense ``d x d`` image matrix.
     """
+
+    stochastic_heun_compatible = False
 
     def __init__(
         self,
@@ -922,6 +929,8 @@ class DiagonalPlusLowRankMobility(nn.Module):
     ``(B,d,rank)``. The determinant is normalized using the matrix
     determinant lemma, without materializing a dense ``d x d`` matrix.
     """
+
+    stochastic_heun_compatible = False
 
     def __init__(
         self,
@@ -1506,17 +1515,25 @@ def riemannian_langevin_heun_step(
     diagonal diffusion square root, the equivalent Stratonovich drift used by
     Heun contains ``0.5 * epsilon * div G``.  The same Brownian increment is
     reused in the predictor and corrector.
+
+    Disabling the flag removes this explicit Stratonovich term. Multiplicative
+    noise still induces ``0.5 * epsilon * div G`` in the equivalent Ito drift.
+    Use Euler-Maruyama to ablate the entire Ito divergence correction.
+    State-dependent non-diagonal factors require their own conversion and
+    must declare ``stochastic_heun_compatible = False``.
     """
 
     if dt <= 0:
         raise ValueError("dt must be positive")
     if next_mobility is None:
         next_mobility = mobility
-    current_requires_full_sqrt = _temperature_is_nonzero(epsilon) and hasattr(
-        mobility, "sample_sqrt_noise"
+    current_requires_full_sqrt = _temperature_is_nonzero(epsilon) and (
+        not getattr(mobility, "stochastic_heun_compatible", True)
+        or hasattr(mobility, "sample_sqrt_noise")
     )
-    next_requires_full_sqrt = _temperature_is_nonzero(next_epsilon) and hasattr(
-        next_mobility, "sample_sqrt_noise"
+    next_requires_full_sqrt = _temperature_is_nonzero(next_epsilon) and (
+        not getattr(next_mobility, "stochastic_heun_compatible", True)
+        or hasattr(next_mobility, "sample_sqrt_noise")
     )
     if current_requires_full_sqrt or next_requires_full_sqrt:
         raise TypeError(

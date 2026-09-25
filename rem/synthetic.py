@@ -150,6 +150,7 @@ class AnalyticWarpMobility(nn.Module):
     """
 
     divergence_probe_cost = 0
+    stochastic_heun_compatible = False
 
     def __init__(self, curvature: float) -> None:
         super().__init__()
@@ -335,6 +336,8 @@ class ConvexRidgeMirrorPotential(nn.Module):
 class InverseHessianMobility(nn.Module):
     """Mobility ``G=(nabla^2 Phi)^{-1}`` induced by a convex mirror map."""
 
+    stochastic_heun_compatible = False
+
     def __init__(self, mirror_potential: ConvexRidgeMirrorPotential) -> None:
         super().__init__()
         self.mirror_potential = mirror_potential
@@ -405,6 +408,8 @@ class AdditiveResidualSampler(nn.Module):
 
 class AnalyticRotatingMobility(nn.Module):
     """Two-dimensional determinant-one mobility with rotating eigendirections."""
+
+    stochastic_heun_compatible = False
 
     def __init__(self, anisotropy: float = 0.8, rotation_rate: float = 0.7) -> None:
         super().__init__()

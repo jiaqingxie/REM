@@ -187,6 +187,8 @@ def langevin_chain(
 
     ``temperature`` may be constant or a function of the step. Saved states
     are detached CPU tensors so long trajectories do not retain GPU graphs.
+    With Heun, the correction flag toggles the explicit Stratonovich drift
+    term; Euler ablates the entire Ito divergence drift when it is disabled.
     """
 
     if steps < 0 or dt <= 0 or divergence_samples < 1:

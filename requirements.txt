@@ -1,16 +1,6 @@
-matplotlib
-numpy
-POT
-torch
-torchdyn
-torchcfm
-pandas
-absl-py
-torchvision
-tqdm
-einops
-torchmetrics
-torchsde
-python-Levenshtein
-omegaconf
-torch-fidelity
+# Core synthetic experiments and tests. Install the matching torchvision
+# version with PyTorch before adding requirements-images.txt.
+torch>=2.4
+numpy>=1.26
+scipy>=1.12
+matplotlib>=3.8

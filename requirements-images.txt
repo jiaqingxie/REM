@@ -1,0 +1,6 @@
+-r requirements.txt
+torchvision>=0.19
+torchcfm==1.0.7
+POT==0.9.5
+torchmetrics[image]==1.9.0
+torch-fidelity==0.4.0

@@ -146,7 +146,12 @@ def parse_args() -> argparse.Namespace:
         help="Override the mobility state selection; defaults to --use-ema.",
     )
     parser.add_argument(
-        "--divergence-correction", action=argparse.BooleanOptionalAction, default=True
+        "--divergence-correction", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "Toggle the explicit drift correction. Euler removes the full Ito term; "
+            "Heun removes the explicit Stratonovich term and retains the "
+            "noise-induced half correction in Ito form."
+        ),
     )
     parser.add_argument("--divergence-samples", type=int, default=1)
     parser.add_argument(

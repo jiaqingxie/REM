@@ -3,7 +3,13 @@ import unittest
 import torch
 from torch import nn
 
-from rem.geometry import AdditiveResidualTransport, IdentityMobility
+from rem.geometry import (
+    AdditiveResidualTransport,
+    IdentityMobility,
+    TemperedFullMobility,
+    riemannian_langevin_heun_step,
+)
+from rem.networks import build_mobility
 from rem.sampling import (
     constant_temperature,
     energy_matching_temperature,
@@ -13,7 +19,12 @@ from rem.sampling import (
     profile_langevin_chain,
     profile_step_components,
 )
-from rem.synthetic import AnalyticDiagonalMobility, HutchinsonDivergenceWrapper
+from rem.synthetic import (
+    AnalyticDiagonalMobility,
+    AnalyticRotatingMobility,
+    AnalyticWarpMobility,
+    HutchinsonDivergenceWrapper,
+)
 
 
 class QuadraticEnergy(nn.Module):
@@ -223,6 +234,71 @@ class SamplingTests(unittest.TestCase):
                 temperature=0.1,
                 integrator="heun",
             )
+
+    def test_heun_rejects_non_diagonal_sqrt_apply_models_at_both_endpoints(self):
+        full = build_mobility("full", (2,), hidden_dim=4, depth=2).double()
+        variants = [
+            full,
+            TemperedFullMobility(full, 0.5),
+            AnalyticWarpMobility(1.2).double(),
+            AnalyticRotatingMobility().double(),
+            HutchinsonDivergenceWrapper(full),
+        ]
+        initial = torch.tensor([[0.4, -0.7]], dtype=torch.float64)
+        energy = QuadraticEnergy()
+        for mobility in variants:
+            for at_next_endpoint in (False, True):
+                with self.subTest(mobility=type(mobility).__name__, next=at_next_endpoint):
+                    with self.assertRaisesRegex(TypeError, "diagonal mobility square roots"):
+                        riemannian_langevin_heun_step(
+                            energy, energy,
+                            IdentityMobility() if at_next_endpoint else mobility,
+                            initial, dt=0.01,
+                            epsilon=0.0 if at_next_endpoint else 0.1,
+                            next_epsilon=0.1,
+                            next_mobility=mobility if at_next_endpoint else IdentityMobility(),
+                        )
+        # Full mobility remains valid in the deterministic phase of the paper schedule.
+        final, _ = langevin_chain(
+            energy, full, initial, steps=2, dt=0.1, integrator="heun",
+            temperature=energy_matching_temperature(0.1, dt=0.1, time_cutoff=0.1, ramp_end=0.1),
+            mobility_schedule=phase_gated_mobility(full, dt=0.1, active_until=0.1),
+            generator=torch.Generator().manual_seed(0),
+        )
+        self.assertTrue(torch.isfinite(final).all())
+
+    def test_heun_disabled_explicit_term_retains_noise_induced_ito_drift(self):
+        class ExponentialDiagonal(nn.Module):
+            def diagonal(self, x):
+                log_first = 0.3 * x[:, 0]
+                return torch.stack((log_first.exp(), (-log_first).exp()), dim=1)
+
+            def apply(self, x, vector):
+                return self.diagonal(x) * vector
+
+            def sqrt_apply(self, x, noise):
+                return self.diagonal(x).sqrt() * noise
+
+            def divergence(self, x, **kwargs):
+                return torch.stack((0.3 * (0.3 * x[:, 0]).exp(), torch.zeros_like(x[:, 0])), dim=1)
+
+        mobility = ExponentialDiagonal()
+        point = torch.tensor([[0.4, -0.7]], dtype=torch.float64)
+        # These four noises integrate the first two Gaussian moments exactly.
+        noise = torch.tensor([[-1., -1.], [-1., 1.], [1., -1.], [1., 1.]], dtype=torch.float64)
+        initial = point.expand(4, -1)
+        dt, epsilon = 1e-6, 0.2
+        for enabled, ito_fraction in ((True, 1.0), (False, 0.5)):
+            with self.subTest(explicit_correction=enabled):
+                final = riemannian_langevin_heun_step(
+                    QuadraticEnergy(), QuadraticEnergy(), mobility, initial,
+                    dt=dt, epsilon=epsilon, next_epsilon=epsilon, noise=noise,
+                    include_divergence_correction=enabled, divergence_method="exact",
+                )
+                observed = (final - initial).mean(dim=0) / dt
+                expected = (-mobility.apply(point, point)
+                            + ito_fraction * epsilon * mobility.divergence(point))[0]
+                torch.testing.assert_close(observed, expected, atol=2e-6, rtol=0.0)
 
     def test_temperature_schedules(self):
         x = torch.zeros(1, 1)
